@@ -14,3 +14,9 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+# e2e_smoke.py needs a GPU and a real engine, and is driven by CLI flags rather
+# than collected: keep plain `pytest` to the checks that run anywhere.
+testpaths = ["tests"]
+python_files = ["test_*.py"]

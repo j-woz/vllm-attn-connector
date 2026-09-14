@@ -23,11 +23,10 @@ src/vllm_attn_connector/
     probe.py        attention-backend override that copies the decode query
     kernels.py      Triton q.Kt against the paged cache, plus a torch reference
     layout.py       KV cache layout resolution across vLLM backends
+tests/
+    test_aggregations.py   pure torch, no GPU or vLLM needed
+    e2e_smoke.py           real engine, asserts 38 properties of the output
 ```
-
-Tests live outside the package, in `experiments/vllm-attn-connector/` of the
-parent workspace, because the end-to-end one needs a GPU and a real engine.
-See [Validation](#validation).
 
 > This repository previously held `vllm-kvnorm`, a connector that scored
 > cache-only KV norms. That approach was retired: statistics computable from the
@@ -316,15 +315,18 @@ others do not.
 ## Validation
 
 ```bash
-# no GPU required: streaming reduction vs dense reference
-python experiments/vllm-attn-connector/test_aggregations.py
+# no GPU, no vLLM: streaming reduction and segment planning vs references
+pytest tests/test_aggregations.py
 
 # end to end against a real engine
-python experiments/vllm-attn-connector/e2e_smoke.py
-python experiments/vllm-attn-connector/e2e_smoke.py --ranges                   # variable segments
-python experiments/vllm-attn-connector/e2e_smoke.py --chunk-size 1 --top-pct 100  # full capture
-python experiments/vllm-attn-connector/e2e_smoke.py --top-pct 25 --chunk-size 64
+python tests/e2e_smoke.py
+python tests/e2e_smoke.py --ranges                        # variable segments
+python tests/e2e_smoke.py --chunk-size 1 --top-pct 100    # full capture
+python tests/e2e_smoke.py --top-pct 25 --chunk-size 64
 ```
+
+See [`tests/README.md`](tests/README.md) for what each covers, and for what is
+*not* covered — preemption and tensor parallelism both lack tests.
 
 The e2e asserts 32 properties. The load-bearing ones:
 
