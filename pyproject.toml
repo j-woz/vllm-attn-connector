@@ -3,11 +3,11 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm-kvnorm"
+name = "vllm-attn-connector"
 version = "0.1.0"
-description = "Out-of-tree vLLM KV connector that captures per-token KV importance scores as Flowcept provenance (PagedEviction proxy)."
+description = "Out-of-tree vLLM connector capturing exact per-decode-step attention over the prompt, as Flowcept provenance."
 requires-python = ">=3.10"
-dependencies = []  # vllm and flowcept are provided by the host environment
+dependencies = []  # vllm and flowcept provided by the host environment
 
 [tool.setuptools.packages.find]
 where = ["src"]

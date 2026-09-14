@@ -1,336 +1,380 @@
-# vllm-kvnorm
+# vllm-attn-connector
 
-Captures **one importance score per token** from vLLM's paged KV cache at the
-moment a request finishes, and emits it as **Flowcept provenance** — after all its KV has been written, but before its
-blocks are returned to the block pool.
+Captures **exact per-decode-step attention over the prompt** from a running vLLM
+engine and emits it as **Flowcept provenance**.
 
-The score is the PagedEviction proxy (Chitty-Venkata et al., *Findings of EACL
-2026*, [arXiv:2509.04377](https://arxiv.org/abs/2509.04377)), Algorithm 1,
-averaged over KV heads and layers:
+For each decode step `t` and prompt token `j` it records
 
 ```
-S_i = mean over layers and kv heads of  ||V_i||_2 / ||K_i||_2
+a[t, j] = softmax( q_t · K_promptᵀ / √d )[j]
 ```
 
-High `S` means important: per Devoto et al. 2024
-([arXiv:2406.11430](https://arxiv.org/abs/2406.11430)) a key's L2 norm is
-*inversely* proportional to that token's cumulative attention score.
+reduced over layers and heads, per KV cache group. The result answers "which
+prompt tokens did *this* generated token attend to", per token, rather than
+"which prompt tokens mattered overall".
 
-This avoids attention scores entirely, so **no FlashAttention kernel changes are
-needed** — which is the whole reason the metric exists.
+**No vLLM source is patched and no attention kernel is modified.**
 
-## Design
-
-Implemented as an **out-of-tree `KVConnector`**. vLLM is not modified at all;
-`kv_connector_module_path` loads the class from this package
-(`KVConnectorFactory.get_connector_class`).
-
-`K` and `V` for a token are written once and never change, so a token can be
-scored in the step that writes it. That is the whole design, and it is what lets
-the connector avoid ever holding on to KV blocks:
+## Repository layout
 
 ```
-step N   schedule()        -> metadata: which requests wrote how many tokens
-         start_load_kv()   -> emit any request that finished, after waiting on
-                              the event covering its last scoring launch
-         <forward>         -> writes this step's KV
-         wait_for_save()   -> launch scoring for exactly this step's new tokens,
-                              on a side CUDA stream, into a per-request buffer
+src/vllm_attn_connector/
+    connector.py    KVConnector: recomputes q.Kt, reduces, selects, emits
+    probe.py        attention-backend override that copies the decode query
+    kernels.py      Triton q.Kt against the paged cache, plus a torch reference
+    layout.py       KV cache layout resolution across vLLM backends
 ```
 
-By the time a request finishes, every one of its tokens has already been scored.
-Its blocks are never read again, so there is nothing to pin, nothing to release,
-and no way for capture to withhold memory from the pool.
+Tests live outside the package, in `experiments/vllm-attn-connector/` of the
+parent workspace, because the end-to-end one needs a GPU and a real engine.
+See [Validation](#validation).
 
-Scoring runs on a side stream ordered after the forward that wrote the KV
-(`stream.wait_stream`), so it overlaps the *next* forward instead of delaying
-this one. A request that finishes while its scoring is still in flight is held
-back by a CUDA event until it completes.
+> This repository previously held `vllm-kvnorm`, a connector that scored
+> cache-only KV norms. That approach was retired: statistics computable from the
+> cache alone are request-invariant, so they cannot explain request-specific
+> behaviour. The query is the missing ingredient, and it is never cached — hence
+> the backend probe here. The kvnorm history remains in this repository's log.
 
-Three details worth knowing:
+## How it works
 
-- Emission happens in `start_load_kv`, scoring in `wait_for_save`. That split is
-  deliberate: `wait_for_save` is skipped on the no-forward path
-  (`kv_connector_no_forward` passes `wait_for_save=False`), which is correct for
-  scoring -- no forward means no new tokens -- but emission must still run there,
-  and `start_load_kv` always does.
-- Completion is reported via `build_connector_worker_meta`, not `get_finished`.
-  `get_finished` asserts the request is still in `Scheduler.requests`, which is
-  false here because the request tears down normally.
-- Only the first KV cache group is scored.
+The scores are **recomputed, not extracted**. FlashAttention tiles the softmax
+and discards the intermediate scores, so there is nothing to read back. But `K`
+persists in the paged cache, and a single decode row is a matvec — cheap enough
+to redo on a side stream.
 
-### Model-agnostic
+Queries are the missing ingredient: they are never cached. A small backend
+override copies them during the forward pass; everything else happens in the
+connector.
 
-Nothing is hard-coded to FlashAttention. vLLM's per-layer KV tensor always has
-the *logical* shape from `AttentionBackend.get_kv_cache_shape()`; the NHD/HND
-choice only permutes strides. `layout.py` dispatches on that logical shape and
-produces copy-free canonical views `(num_blocks, block_size, num_kv_heads,
-head_size)`, and the Triton kernel reads `.stride()` off the tensors. Supported:
+```
+step N
+  bind_connector_metadata()   connector learns this step's requests
+  start_load_kv()             emit anything that finished last step
+  <forward>
+      impl.forward(...)       PROBE: if max_query_len==1, copy q   [blocking, ~16 KB/layer]
+                              then super().forward() unchanged
+  wait_for_save()             CONNECTOR: q·Kᵀ, softmax, reduce      [overlapped, side stream]
+```
 
-| Logical shape | Label |
-|---|---|
-| `(num_blocks, num_kv_heads, block_size, head_size + head_size_v)` | `fused_head_major` (FlashAttention) |
-| `(num_blocks, block_size, num_kv_heads, head_size + head_size_v)` | `fused_token_major` |
-| `(2, num_blocks, block_size, num_kv_heads, head_size)` | `split_token_major` |
-| `(2, num_blocks, num_kv_heads, block_size, head_size)` | `split_head_major` |
+| stage | cost | blocking |
+|---|---|---|
+| probe copies `q` | `heads × head_size × n_reqs` per layer | yes, sub-microsecond |
+| `q·Kᵀ`, softmax, reduce | one matvec per request per layer | no — side stream |
+| `event.synchronize()` at finish | one event per request | yes, once |
 
-Layers that don't match (Mamba/linear-attention state, MLA latents, quantised
-caches) are skipped with a warning; the rest still work.
+Two implementation notes that are easy to get wrong if you fork this:
+
+**The probe overrides the backend impl, not the `Attention` module.**
+`Attention.forward` is traced through by `torch.compile`; only the custom op
+`unified_attention_with_output` survives as a runtime node, and it dispatches
+`self.impl.forward(...)` dynamically. An `nn.Module` forward hook would not fire
+under CUDA graphs.
+
+**Decode only.** In decode each request contributes exactly one query token, so
+batch row *i* is request slot *i* — no `query_start_loc` parsing and no
+token-to-request mapping is needed. Prefill is skipped; see
+[Limitations](#limitations).
 
 ## Install
 
-Assumes vLLM (with Triton) is already installed. Two more things must be
-importable:
-
-- **this package**, `vllm_kvnorm`;
-- **Flowcept**, including its `vllm` adapter
-  (`flowcept/src/flowcept/flowceptor/adapters/vllm/`). A released Flowcept will
-  not have that adapter yet, so it must come from the local checkout.
-
-Pick whichever fits what you are doing.
-
-**Not editing either package** — install them:
-
-```bash
-pip install ../flowcept .
-```
-
-**Editing either package** — put them on the path instead, so changes take
-effect immediately:
-
 ```bash
 ROOT=$(cd .. && pwd)
-export PYTHONPATH="$ROOT/vllm-kvnorm/src:$ROOT/flowcept/src"
+export PYTHONPATH="$ROOT/vllm-attn-connector/src:$ROOT/flowcept/src"
+export FLOWCEPT_SETTINGS_PATH="$ROOT/flowcept/agent_sandbox/settings.yaml"
 ```
 
-`PYTHONPATH` is inherited by vLLM's EngineCore subprocess, so the connector
-resolves there too. Avoid a plain `pip install` while editing: it snapshots the
-source, so you would silently keep testing the previously installed copy. (An
-editable install, `pip install -e`, also avoids that if you prefer it.)
+Flowcept must come from a checkout that contains
+`flowceptor/adapters/vllm/`.
 
-If `transformers` fails to import due to a torchaudio/CUDA version mismatch,
-`pip uninstall torchaudio` — vLLM only needs it for audio models.
+Requires a CUDA device and Triton. Tested against vLLM 0.27.x with
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`; with multiprocessing enabled the emitted
+records leave the process and Flowcept needs a reachable message queue.
 
-## Usage
-
-Scores are emitted through Flowcept's `vllm` adapter
-(`flowcept.flowceptor.adapters.vllm.VLLMInterceptor`), so they land in
-Flowcept's normal MQ/Mongo pipeline alongside the rest of your provenance.
+## Quickstart
 
 ```python
+import vllm_attn_connector
+# MUST precede engine construction: _cached_get_attn_backend is @cache'd, so the
+# backend class is resolved once and never re-read.
+assert vllm_attn_connector.install_probe()
+
 from flowcept import Flowcept
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 
-with Flowcept("vllm", workflow_id="my-experiment", workflow_name="my_experiment"):
+with Flowcept("vllm", workflow_id="my-run", workflow_name="my_run"):
     llm = LLM(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
+        model="Qwen/Qwen3-4B-Instruct-2507",
         kv_transfer_config=KVTransferConfig(
-            kv_connector="KVNormConnector",
-            kv_connector_module_path="vllm_kvnorm",
+            kv_connector="AttnConnector",
+            kv_connector_module_path="vllm_attn_connector",
             kv_role="kv_producer",
-            kv_connector_extra_config={"workflow_id": "my-experiment"},
+            kv_connector_extra_config={"workflow_id": "my-run"},
         ),
     )
-    llm.generate(["The capital of France is"], SamplingParams(max_tokens=24))
+    llm.generate(["..."], SamplingParams(max_tokens=64))
 ```
 
-> **Use `"kv_role": "kv_producer"`, not `"kv_both"`.** This connector never
-> loads KV, so it is not a consumer. Declaring it one sets
-> `KVTransferConfig.is_kv_consumer`, which combined with async scheduling (on by
-> default) makes the scheduler set `defer_block_free = True`
-> (`scheduler.py:155`). Preempted blocks then go to a deferred queue instead of
-> straight back to the pool, so the preemption loop gets no immediate relief and
-> cascades: on a saturated pool this workload preempted **19** times with
-> `kv_both` versus **3** with `kv_producer` -- the same as running with no
-> connector at all. Capture is identical either way.
+Use `kv_role="kv_producer"`, not `"kv_both"` — this connector never loads KV,
+and declaring it a consumer makes the scheduler defer block frees.
 
-`kv_connector_extra_config` takes exactly one optional key, `workflow_id`: the
-*parent* workflow this run nests under. There is nothing else to configure.
+## Configuration
 
-Two things to know:
+All keys go in `kv_connector_extra_config`.
 
-- **A live MQ (Redis) is required** for the default multiprocess setup. vLLM runs
-  its scheduler in a separate EngineCore process, so the interceptor publishes
-  from there, exactly as Flowcept's Dask adapter does from workers. Setting
-  `VLLM_ENABLE_V1_MULTIPROCESSING=0` puts everything in one process and removes
-  the requirement — that is what the tests and the example do.
-- **The run registers its own workflow, it does not reuse yours.** Flowcept
-  records a given workflow once, so reusing the caller's id would silently drop
-  the model configuration. Join on `parent_workflow_id`.
+| key | default | meaning |
+|---|---|---|
+| `workflow_id` | — | parent workflow to attach records to |
+| `max_steps` | `0` | decode steps recorded per request; `0` = every one |
+| `top_pct` | `10` | percent of positions kept within each segment |
+| `chunk_size` | `32` | segment width when no ranges are declared; `0` = one segment |
+| `layer_stats` | `false` | opt-in per-head diagnostics; roughly +50% cost |
 
-## Output format
+By default **every decode token is recorded**. Step-indexed buffers start at 64
+rows and double as needed, so unbounded capture costs no more than a bounded one
+for short generations, and long generations are not silently truncated. Set a
+positive `max_steps` to cap memory explicitly; steps beyond the cap are counted
+in `decode_steps_dropped` rather than lost quietly.
 
-Two Flowcept record types. One **workflow** per run, carrying everything needed
-to interpret the tasks -- in particular the tokenizer, without which
-`prompt_token_ids` cannot be decoded:
-
-```jsonc
+```json
 {
-  "type": "workflow",
-  "workflow_id": "vllm-kvnorm-daea0462c1ca",
-  "parent_workflow_id": "my-experiment",
-  "name": "facebook/opt-125m",
-  "conf": {
-    "model": "facebook/opt-125m", "tokenizer": "facebook/opt-125m",
-    "tokenizer_mode": "auto", "trust_remote_code": false,
-    "dtype": "torch.float16", "max_model_len": 512,
-    "architectures": ["OPTForCausalLM"], "tensor_parallel_size": 1
+  "kv_connector": "AttnConnector",
+  "kv_connector_module_path": "vllm_attn_connector",
+  "kv_role": "kv_producer",
+  "kv_connector_extra_config": {
+      "workflow_id": "my-run",
+      "top_pct": 10,
+      "chunk_size": 32
   }
 }
 ```
 
-One **task** per finished request:
+### Segments: fixed or variable
 
-```jsonc
-{
-  "type": "task", "subtype": "kv_token_importance",
-  "task_id": "0-9100089a:g0",
-  "workflow_id": "vllm-kvnorm-daea0462c1ca",
-  "activity_id": "kv_token_importance", "status": "FINISHED",
+Storing the full `[decode_steps, prompt_tokens]` matrix does not scale — it is
+linear in prompt length and grows without bound on long contexts. Instead the
+prompt is **partitioned into segments** and the strongest `top_pct` percent of
+positions is kept *within each one*.
 
-  "used": {
-    "request_id": "0-9100089a",
-    "prompt_token_ids": [2, 133, 812, 9, 1470, 16],   // "</s>The capital of France is"
-    "num_prompt_tokens": 6, "num_computed_tokens": 29
-  },
-  "generated": {
-    "score": [0.0132, 0.1332, 0.1630, ...]            // one float per token, in order
-  },
-  "custom_metadata": {
-    "metric": "pagedeviction_v_over_k_l2",
-    "metric_reference": "arXiv:2509.04377 Algorithm 1",
-    "kv_cache_group_id": 0, "num_layers": 12, "num_kv_heads": 12,
-    "num_tokens": 29, "finished_at": 1787003963.9
-  }
-}
-```
+Selecting per segment rather than over the whole prompt is the point: a global
+top-X% concentrates wherever the distribution happens to peak and can leave
+entire regions with no stored entry at all, which makes those regions invisible
+downstream. Per-segment selection guarantees every region is represented, with
+a floor of one entry per segment however short it is.
 
-`score[i]` is the importance of token `i`, in sequence order. There are exactly
-`num_computed_tokens` of them.
+Segments come from one of two places, and **the output is identical either way**:
 
-Decode the prompt with the tokenizer recorded on the workflow:
+**Fixed** (default) — uniform blocks of `chunk_size` tokens. Use when the prompt
+has no structure you can declare.
+
+**Variable** — ranges you declare per request, one per document, tool output,
+retrieved chunk, or whatever unit you want statistics for:
 
 ```python
-from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained(workflow["conf"]["tokenizer"])
-tok.convert_ids_to_tokens(task["used"]["prompt_token_ids"])
+SamplingParams(
+    max_tokens=256,
+    extra_args={"kv_transfer_params": {"ranges": [[131, 496], [496, 548], [578, 765]]}},
+)
 ```
 
-`num_computed_tokens` is the number of positions that actually have KV, which is
-**`len(prompt) + len(output) - 1`**: the final sampled token is never fed back
-through the model, so no K/V is ever written for it. `prompt_token_ids` labels
-only the first `num_prompt_tokens` scores; the rest are generated tokens, whose
-ids are not captured.
+Ranges are clamped to the prompt, sorted, and the **gaps between them become
+segments too**, so the partition stays complete and `topk_residual` stays exact.
+Overlaps are resolved by truncation. Malformed input is ignored with a warning
+rather than raised — provenance capture must never fail a generation request.
 
-One task per `(request, kv_cache_group)`. Models with a single attention type --
-most models -- have one group, hence one task per request.
+Whichever mode produced a record, the partition is emitted as `segments`, so a
+consumer runs the same per-segment aggregation without knowing or caring which
+was used. `metadata.segment_mode` says which it was.
 
-### Size
+Entries kept per step is `sum(max(1, round(top_pct/100 × len(seg))))` over
+segments. Note the round-and-floor: with `top_pct` small and segments short, the
+floor of 1 dominates and the effective rate is higher than `top_pct`.
 
-One float per token, rounded to 6 decimals, is **~10 bytes/token**, plus ~6
-bytes per prompt token — around 1 KB per request for a short generation,
-including all metadata. A 128K
-context request is ~1.3 MB regardless of model size, since layers and heads are
-reduced away on GPU. This is why there is no top-K or reduction knob: the output
-does not scale with model depth or width.
+**Full capture** — `chunk_size=1, top_pct=100` makes every position its own
+segment and keeps all of them. That is the replacement for the dense mode this
+connector used to have: same information, same field names, no separate code
+path.
 
-## Tests
+## Emitted fields
 
-Tests live in the sibling experiments repo, `../experiments/vllm-kvnorm/`:
+Per request, per KV cache group, under `<req>:g<group>`. Write `G` for decode
+steps recorded, `T` for prefill tokens scored, `k` for entries kept per step.
+
+**Sparse mode** (default, `top_pct > 0`):
+
+| field | shape | meaning |
+|---|---|---|
+| `topk_pos` | `[G, k]` int | retained prefill positions, ascending; `-1` pads the ragged final chunk |
+| `val_all_max` | `[G, k]` | attention at those positions, **max** over all (layer, head) |
+| `val_all_avg` | `[G, k]` | attention at those positions, **mean** over all (layer, head) |
+| `topk_head` | `[G, k]` int | which `layer × num_query_heads + head` supplied the max |
+| `topk_residual` | `[G, 1]` | mean-aggregation mass that selection discarded |
+| `segments` | `[n_seg, 3]` int | the partition, as `(lo, hi, keep)` |
+| `attn_sum` | `[T]` | column sum of the mean row, over **all** positions |
+| `attn_peak` | `[T]` | max over (layer, head, decode step), over **all** positions |
+
+`segments` covers `[0, prompt_len_scored)` with no gaps or overlaps, so every
+retained position falls in exactly one segment and a `searchsorted` on the
+segment starts maps positions to segments.
+
+`attn_sum` and `attn_peak` cover every position, including those selection
+dropped, so whole-prompt totals remain available.
+
+### Why both a max and a mean
+
+They answer different questions and neither substitutes for the other.
+
+`val_all_max` is what selection runs on and what tends to be useful for
+attributing a generated token to a prompt span. A mean over all (layer, head)
+pairs dilutes: if a small number of heads carry the retrieval behaviour,
+averaging them against hundreds that do not will bury the signal.
+
+`val_all_avg` is a true probability distribution over positions, which is what
+makes `topk_residual` meaningful — it accounts for exactly the mass selection
+threw away, so `sum(val_all_avg) + topk_residual == 1` per step. A max cannot
+express that, because maxima do not sum to anything.
+
+`topk_head` is free: the max reduction has to identify the winning head anyway.
+
+### Position 0 is never selected
+
+The first prompt token is the attention sink — in decoder-only LLMs it absorbs a
+large, roughly content-independent share of attention
+([arXiv:2309.17453](https://arxiv.org/abs/2309.17453)). Letting it win a slot
+would spend one of the `per_chunk` entries on a token that carries no
+information about what the model is doing.
+
+Its mass remains fully visible in `attn_sum` and `attn_peak`, which cover all
+positions. If you are consuming `topk_pos` you do not need to mask the sink
+yourself: it is never there.
+
+## Output size
+
+Per request, per KV cache group:
+
+```
+k · G · 4      (positions + 2 values + head id)
+  +  G         (residual)
+  +  2·T       (attn_sum, attn_peak)
+  +  3·n_seg   (the partition)
+```
+
+**Size does not depend on the number of heads, layers, or head_size.** Those are
+reduced before anything is stored; they drive *compute*, not output.
+
+| variable | meaning | effect on size |
+|---|---|---|
+| `T` | prefill tokens scored (`prompt_len_scored`) | `2T`, from `attn_sum`/`attn_peak` |
+| `G` | decode steps recorded: all of them, or `max_steps` if capped | linear |
+| `k` | entries kept per step | linear (sparse only) |
+| `n_groups` | KV cache groups: 1 uniform, 2 for some hybrid models | linear |
+| `H`, `L`, `head_size` | heads, layers, head dim | **none** |
+| `FLOAT_DECIMALS`, JSONL | 6 dp text ≈ 2.3× float32 | constant factor |
+
+With the default `max_steps=0`, `G` is the full generation length, so output
+grows with how much the model actually produces. A positive `max_steps` bounds
+it. The `k` factor is under your direct control via `top_pct` and the segment
+widths, which is what keeps long prompts affordable. `metadata` also carries `matrix_shape`, `matrix_fields`,
+`decode_steps_recorded`, `decode_steps_nonfinite`, `restarts`,
+`prompt_len_scored`, `chunk_size`, `per_chunk` and `no_entry_sentinel`.
+
+## Performance
+
+Cost is dominated by recomputing `q·Kᵀ`, which re-reads the prompt's keys from
+the paged cache once per decode step per layer. It is memory-bandwidth bound,
+so it scales with `prompt_tokens × layers × heads × head_size` and is largely
+insensitive to what you do with the result afterwards.
+
+Practical consequences:
+
+- **Selection does not reduce compute**, only output size. Keeping 10% of
+  positions costs the same as keeping all of them. Choose `top_pct` and the
+  segmentation for storage and for the granularity you want statistics at, not
+  for speed.
+- **Longer prompts cost proportionally more**, since the whole prompt's `K` is
+  re-read every step.
+- **Cost is per decode step**, so it scales with generation length. `max_steps`
+  caps that if you need a ceiling; by default there is none.
+- **Per-head detail is expensive.** Anything that has to carry per-head state
+  through the reduction — such as `layer_stats` — costs substantially more than
+  the reduced statistics, because the reduction is what keeps the inner loop
+  cheap.
+
+On a single consumer GPU with a 4B model and prompts of a few thousand tokens,
+end-to-end generation slowdown is high single digit percent, and recording
+every decode token rather than a capped prefix does not measurably change it.
+Measure on your own workload before budgeting: the ratio depends on prompt
+length, generation length and how much headroom the model leaves on your
+device.
+
+Two measurement pitfalls, both of which produced wrong numbers during
+development: interleave capture and no-capture runs **in one session**, since
+GPU clock and thermal state drift between sessions by more than the effect
+being measured; and discard the first run of a session, which pays warmup the
+others do not.
+
+## Validation
 
 ```bash
-cd ../experiments/vllm-kvnorm
-pytest test_kernels.py -q             # kernel + layout units
-pytest test_incremental_scoring.py -q # step-by-step scoring == one-shot
-python e2e_smoke.py                   # real vLLM run + record schema
-python test_preemption.py             # preemption does not perturb the capture
+# no GPU required: streaming reduction vs dense reference
+python experiments/vllm-attn-connector/test_aggregations.py
+
+# end to end against a real engine
+python experiments/vllm-attn-connector/e2e_smoke.py
+python experiments/vllm-attn-connector/e2e_smoke.py --ranges                   # variable segments
+python experiments/vllm-attn-connector/e2e_smoke.py --chunk-size 1 --top-pct 100  # full capture
+python experiments/vllm-attn-connector/e2e_smoke.py --top-pct 25 --chunk-size 64
 ```
 
-`test_incremental_scoring.py` is the load-bearing one. It drives
-`_WorkerSide.score_step` with synthetic metadata and asserts that accumulating a
-sequence across steps reproduces a single pass over the whole thing -- under
-chunked prefill, incrementally arriving blocks, preemption restarts and
-concurrent requests.
+The e2e asserts 32 properties. The load-bearing ones:
 
-That property is where the bugs are. An early version passed the per-layer
-output buffer straight to the kernel, which *stores* rather than accumulates, so
-only the last layer survived and every score was wrong by roughly 100%. Nothing
-end-to-end caught it, because those checks only compared the connector against
-itself. Reintroducing that bug fails 6 of the 8 cases here.
+- **`sum(val_all_avg) + topk_residual == 1`** at every step, so the output is a
+  genuine probability distribution with the discarded mass accounted for
+  exactly, not a plausible-looking artifact.
+- **The partition is complete**: segments cover the prompt with no gaps or
+  overlaps, and every declared range appears verbatim as a segment.
+- **The attention sink is reproduced** at two to three orders of magnitude above
+  the median position. Recovering a known property of the model is evidence the
+  recomputation is reading real keys.
+- **Attention changes between decode steps.** Under selection this shows up as
+  turnover in the retained position set (adjacent-step Jaccard well below 1);
+  under full capture it is measured as total-variation distance between
+  consecutive steps. If attention did not move, per-step capture would be
+  redundant with `attn_sum` and this package would have no purpose.
+- **Every segment is represented in every step**, the invariant that
+  per-segment selection exists to provide.
 
-Validated on `facebook/opt-125m` (MHA, 12 layers, 12 KV heads) and
-`Qwen/Qwen2.5-0.5B-Instruct` (GQA, 24 layers, 2 KV heads).
+The Triton kernel matches a pure-torch reference to ~1e-08 across full, partial
+and single-key sequences.
 
-## Tensor parallelism
+## Limitations
 
-**One task per request, not one per rank.**
-
-vLLM creates a worker-role connector on *every* TP rank (`gpu_worker.py:662`),
-and each rank holds only its shard of the KV heads
-(`num_kv_heads // tp_size`, replicated when `tp_size` exceeds the head count).
-So each rank can only compute a *partial* score, and left alone they would all
-emit a task under the same `task_id`.
-
-The connector therefore all-reduces before emitting:
-
-```python
-score = tensor_model_parallel_all_reduce(score) / tp_size   # every rank
-if tp_rank != 0:
-    continue                                                # only rank 0 writes
-```
-
-Averaging the per-rank shard means recovers the mean over all heads. That holds
-in both sharding regimes: with `tp_size <= num_kv_heads` the shards partition the
-heads, and with `tp_size > num_kv_heads` vLLM replicates each head the same
-number of times, so the average stays uniform over distinct heads.
-
-The collective runs on every rank *before* the rank-0 check, so all ranks reach
-it. This is safe because connector metadata is broadcast from the scheduler, so
-every rank iterates the same requests in the same order.
-
-Consequences:
-
-- exactly one record per request, identical to the TP=1 output;
-- the score is the true all-head mean, not a shard mean;
-- no per-rank output files.
-
-`test_kernels.py` verifies the reduction maths for `tp_size` of 1, 2, 4 and for
-the replicated case, by simulating shards over the head axis — no multi-GPU
-needed. The all-reduce itself is exercised only under a real multi-GPU run,
-which has not been tested here (single-GPU machine).
-
-## Preemption is a non-issue
-
-`Scheduler._preempt_request` frees a request's blocks directly
-(`scheduler.py:1352`), bypassing the connector hook. That is fine, and requires
-no handling:
-
-- preemption resets `num_computed_tokens` to 0 and requeues the request, which is
-  then **fully recomputed**;
-- the connector keys off `num_computed_tokens`, so it simply re-scores the
-  recomputed tokens over the same buffer positions -- the operation is
-  idempotent;
-- so nothing is missed, and nothing is double counted.
-
-`test_preemption.py` forces this (8 prompts, 10 blocks → 13 preemptions) and
-confirms one record per request, not one per preemption, covering the full final
-sequence. `test_incremental_scoring.py` covers the restart arithmetic directly.
-
-## Known limitations
-
-- **Quantised KV caches (FP8/NVFP4) are skipped.** Norms would need scale
-  plumbing to be meaningful.
-- **MLA layouts are skipped** — there is no separate V to take a norm of.
-- **Only the first KV cache group is scored.** Fine for the single-attention-type
-  models that make up most of the field; hybrid models capture only their first
-  group.
-- **In-flight score buffers grow with sequence length** — one float per token per
-  live request. Negligible in absolute terms (~4 KB per 1k-token request), but it
-  is held for the request's lifetime rather than a couple of steps.
-- **With `VLLM_ENABLE_V1_MULTIPROCESSING=0`, the last batch is not emitted.**
-  A request is reported finished one scheduler step after it ends; with
-  multiprocessing enabled the EngineCore loop keeps stepping on its own while
-  `has_pending_push_work()` is true, but in-process nothing drives it once
-  `generate()` returns. Issue one more trivial request to flush. This does not
-  affect the default (multiprocessing on) or a served endpoint.
+- **Prefill attention is not captured.** Only decode queries are scored;
+  attention *between* prompt tokens during prefill is never computed. If the
+  content behind an answer was assembled into a late prompt position during
+  prefill, decode attention points at that position rather than at the original
+  source. Capturing it would require streaming during prefill, since prefill
+  queries are not cached either.
+- **Attention magnitude is not signed.** A head attending strongly to a token
+  may be suppressing it as easily as using it. High attention means "this token
+  was consulted", not "this token was used affirmatively".
+- **Reduced over layers and heads.** The output cannot tell you *which* layer
+  produced a score, only which head supplied the maximum. `layer_stats` exposes
+  per-head detail at significant cost.
+- **Segments are frozen at the first decode step** and derived from the prompt
+  length settled at that point. Ranges are read from the request's first
+  appearance only; they describe the prompt, which does not change.
+- **Very uneven ranges cost memory.** Selection pads segments to the widest one,
+  so one range far larger than the rest inflates a `[n_seg, max_width]`
+  scratch buffer. Even-ish segments, or a `chunk_size` grid, avoid this.
+- **Scoring cannot currently be restricted to a subset of layers.** Since cost
+  is dominated by re-reading `K` per layer, this is the most promising available
+  speedup and is not yet implemented.
+- **Sliding-window and other non-full attention groups** are scored against the
+  positions actually in cache for that group; `scored_attention` and
+  `attention_window` in the metadata record which regime applied.
+- **Preemption drops partial records.** If a request is preempted and restarted,
+  steps recorded before the restart are discarded rather than stitched, and
+  `restarts` is incremented.
+- **`layout.py` is vendored**, duplicated with `vllm-kvnorm`. If a third package
+  needs it, extract a shared dependency instead of copying again.

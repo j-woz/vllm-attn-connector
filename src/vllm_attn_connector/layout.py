@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model-agnostic resolution of paged KV cache tensors into canonical K/V views.
 
+VENDORED -- third copy (vllm-kvnorm, vllm-expected-attn, here), identical apart
+from the logger name. Out-of-tree connectors must be installable independently
+so none may import another. Three copies is past the point where this should be
+a shared ``vllm-kv-layout`` package; extract it before adding a fourth.
+
 vLLM allocates one tensor per attention layer whose *logical* shape is exactly
 ``AttentionBackend.get_kv_cache_shape(...)``; the NHD/HND choice only permutes
 strides (``_reshape_attention_kv_cache`` ends with ``.permute(*inv_order)``).
@@ -24,7 +29,7 @@ import torch
 try:  # see connector.py for why this uses vLLM's logger namespace
     from vllm.logger import init_logger
 
-    logger = init_logger("vllm.kvnorm")
+    logger = init_logger("vllm.attn_connector")
 except ImportError:  # importable without vLLM, for unit tests
     logger = logging.getLogger(__name__)
 
@@ -118,7 +123,7 @@ def resolve_layer_layout(
             # block_size == num_kv_heads: genuinely ambiguous. FlashAttention's
             # head-major logical shape is the overwhelmingly common case.
             logger.warning(
-                "kvnorm: %s has block_size == num_kv_heads == %d; assuming "
+                "attn_connector: %s has block_size == num_kv_heads == %d; assuming "
                 "head-major (num_blocks, num_kv_heads, block_size, 2*head_size)",
                 h,
                 layer_name,
