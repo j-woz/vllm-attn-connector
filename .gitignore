@@ -8,3 +8,4 @@ output/
 # supplies vllm and flowcept at runtime. Pinned revisions are recorded in
 # Transcript.adoc under "Vendored sources".
 deps/
+flowcept_buffer*.jsonl
