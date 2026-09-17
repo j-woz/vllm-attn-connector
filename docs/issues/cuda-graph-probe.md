@@ -190,3 +190,64 @@ fix adds rather than by silence:
 |---|---|
 | 3166664 | every decode step unscored. The buffer was sized `min(max_cudagraph_capture_size, max_num_seqs)` = 512, and vLLM warms up at `max_num_seqs` = 1024 after capture finishes, so the buffer grew and all 51 graphs lost their copy. The same job also showed the connector reading cudagraph key `None` on every step while the probe had recorded 51 keys, which is what moved the freshness signal into the probe. |
 | 3166820 | the validation script's own staleness check asserted a symbol the redesign had removed. |
+
+### The production models (jobs 3166885, 3166949, 3167116, 3167117)
+
+opt-125m and Qwen2.5-0.5B establish the mechanism. These are the two models the
+connector is used on, served with CUDA graphs on and no compilation-config
+override, which is the configuration that recorded zeros before the fix. Each
+run sends a reference prompt of 300 tokens at temperature 0 and a six-way
+concurrency burst of 150 to 400 tokens with `ignore_eos`.
+
+| model | mode | records | value checks | ref `sum(attn_sum)` | unscored warnings | peak decode tok/s |
+|---|---|---|---|---|---|---|
+| granite-4.2-30b | default | 7/7 | 50 pass, 0 fail | 299.000048 | 0 | 77.1 |
+| granite-4.2-30b | nograph | 7/7 | 50 pass, 0 fail | 298.999924 | 0 | 62.4 |
+| Qwen3.8-27B | default | 7/7 | 74 pass, 0 fail | 298.999996 | 0 | 89.5 |
+| Qwen3.8-27B | nograph | 7/7 | 74 pass, 0 fail | 298.999986 | 0 | 73.7 |
+
+Every record is nonzero and mass-conserving, and on every one of them
+`sum(attn_sum)` equals that record's recorded decode-step count to within 5e-5,
+matching the 150 to 400 token burst exactly. `attn_connector: N decode step(s)
+unscored` appears zero times in all four vLLM logs. granite reports one unscored
+step per run, identical with graphs on and off, from a mixed prefill+decode
+batch during the burst ramp.
+
+Keeping graphs on is worth +23.6% decode throughput on granite and +21.4% on
+Qwen at concurrency 6. Before this fix that throughput was only available by
+recording zeros.
+
+Qwen3.8-27B is the hybrid case, four KV cache groups with three of them Mamba.
+Asserted on every record in both modes:
+
+    PASS  kv_cache_group_id == 3 (got 3)
+    PASS  num_groups == 4 (got 4)
+    PASS  num_query_heads == 24 (got 24)
+    attn_connector: 16 layers in 1 group(s), 24 query heads / 4 kv heads
+
+so the block-table and head-count fixes hold on the replayed path too.
+
+Comparing values across modes needs care. At temperature 0 the two
+configurations use different fused kernels and eventually generate different
+text, after which they are attending with different decode tokens: granite
+matched for 724 characters of 1095 and agreed to 3.901e-04, Qwen diverged after
+21 and came out at 9.342e-02, which measures the divergence and not the probe.
+One decode step has no such freedom, so `--only-single-step` sends the reference
+prompt with `max_tokens=2`, exactly one decode step:
+
+| model | generated | sums | max abs difference / max(attn_sum) | total variation | top-20 overlap |
+|---|---|---|---|---|---|
+| granite-4.2-30b | `' Rome\n'` both | 0.999999, 1.000005 | 2.743e-04 | 0.00045 | 20/20 |
+| Qwen3.8-27B | `' Rome.'` both | 0.999998, 1.000003 | 9.242e-03 | 0.00684 | 20/20 |
+
+granite passes 1e-3 directly. Qwen's 9.242e-03 is that metric's denominator:
+Qwen's attention is diffuse, its largest position holds 0.159 of the mass where
+granite's sink holds 0.623, and the largest absolute difference is 0.001473 at a
+position carrying about a quarter of a percent either way. The distributions
+agree to a total variation distance of 0.7% with the same twenty top positions,
+and the mass agrees to 5e-06. Qwen's head size is 256 against granite's 128, so
+each bf16 logit sums twice as many terms, and `cudagraph_mode=NONE` leaves
+`torch.compile` on, so the prefill that filled the KV cache ran piecewise in one
+mode and eagerly in the other. A capture fault does not look like this: a stale
+or misindexed query gives a different distribution, not the same one with 0.7%
+of its mass moved among near-zero positions, and it does not sum to 1.
