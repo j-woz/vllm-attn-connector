@@ -102,7 +102,8 @@ def run_paccmann(model_dir: str, data_dir: str) -> None:
 
     from vllm_attn_connector.drp_paccmann import PaccmannCapture
 
-    params = pickle.load(open(Path(model_dir) / "final_params.pickle", "rb"))
+    with open(Path(model_dir) / "final_params.pickle", "rb") as handle:
+        params = pickle.load(handle)
     model = MODEL_FACTORY["mca"](dict(params))
     model.load_state_dict(torch.load(Path(model_dir) / "model.pt", map_location="cpu"))
     model.eval()
@@ -175,7 +176,8 @@ def run_hidra(model_dir: str, data_dir: str) -> None:
     from vllm_attn_connector.drp_hidra import HidraCapture
 
     model = load_model(str(Path(model_dir) / "model.h5"), compile=False)
-    geneset = json.load(open(Path(data_dir) / "geneset.json"))
+    with open(Path(data_dir) / "geneset.json") as handle:
+        geneset = json.load(handle)
 
     rec = RecordingInterceptor()
     cap = HidraCapture(model, workflow_id="wf-hidra", interceptor=rec)

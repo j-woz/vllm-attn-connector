@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from vllm_attn_connector.drp_chains import (  # noqa: E402
+from vllm_attn_connector.drp_chains import (
     COLUMNS,
     add_tool_ranges,
     build_chains,
@@ -244,7 +244,7 @@ def test_round1_answer_is_the_lowest_usable_auc():
         qc_start = p.find(">>> qc_lookup")
         qc_block = p[qc_start:p.find("OUTPUT FORMAT", qc_start)]
         failed = {ln for ln, _ in data if re.search(rf"^\s*{re.escape(ln)}\s+failed_assay",
-                                                    qc_block, re.M)}
+                                                    qc_block, re.MULTILINE)}
 
         usable = [(ln, v[0]) for ln, v in data if ln not in failed]
         expected = min(usable, key=lambda t: t[1])[0]
@@ -266,7 +266,7 @@ def test_round2_answer_is_highest_core_auc():
         d_start = p.find(">>> design_lookup")
         panel = p[d_start:p.find("OUTPUT FORMAT", d_start)]
         core = {ln for ln, _ in data
-                if re.search(rf"^\s*{re.escape(ln)}\s+core\s*$", panel, re.M)}
+                if re.search(rf"^\s*{re.escape(ln)}\s+core\s*$", panel, re.MULTILINE)}
 
         cands = [(ln, v[0]) for ln, v in data if ln in core]
         expected = max(cands, key=lambda t: t[1])[0]
@@ -284,7 +284,7 @@ def test_round3_never_answers_the_attention_sink():
             continue
         n += 1
         p = r["prompt"]
-        sink_match = re.search(r"^\s*(\S+)\s+housekeeping_sink", p, re.M)
+        sink_match = re.search(r"^\s*(\S+)\s+housekeeping_sink", p, re.MULTILINE)
         assert sink_match, "no sink declared"
         sink = sink_match.group(1)
         assert r["correct_answer"] != sink, "answered the housekeeping sink"

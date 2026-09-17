@@ -44,17 +44,21 @@ from __future__ import annotations
 
 import csv
 import random
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any
 
 __all__ = [
     "COLUMNS",
-    "Round",
+    "TASK_BUILDERS",
     "Chain",
-    "build_chains",
-    "write_csv",
+    "ChainContext",
+    "Round",
     "add_tool_ranges",
+    "build_chains",
     "load_attention_from_store",
+    "register_task",
+    "write_csv",
 ]
 
 # Exactly the columns of data/opal_chains.csv, in order.
@@ -203,19 +207,21 @@ def _round_sensitivity_ranking(rng, drug, per_line, qc_failed) -> Round:
         question=f"Which cell line is predicted most sensitive to {drug}\n"
         f"(lowest auc)?",
         rules=[
-            "A cell line whose row is flagged in the quality gate cannot be\n"
-            "   the answer, however extreme its value.",
+            (
+                "A cell line whose row is flagged in the quality gate cannot be\n"
+                "   the answer, however extreme its value."
+            ),
             "Lower auc means more sensitive.",
         ],
         tool_blocks=[
             (
-                f'db_lookup(table="predictions", select=["cell_line", "auc_pred"], '
-                f'where="compound=\'{drug}\'")',
+                'db_lookup(table="predictions", select=["cell_line", "auc_pred"], '
+                + f'where="compound=\'{drug}\'")',
                 tbl,
             ),
             (
-                f'qc_lookup(table="predictions", select=["cell_line", "flag"], '
-                f'where="compound=\'{drug}\' and flag is not null")',
+                'qc_lookup(table="predictions", select=["cell_line", "flag"], '
+                + f'where="compound=\'{drug}\' and flag is not null")',
                 qc,
             ),
         ],
@@ -258,8 +264,10 @@ def _round_panel_restricted(rng, prev_line, rows, roles) -> Round:
         question="Among the core panel only, which cell line is predicted\n"
         "least sensitive (highest auc)?",
         rules=[
-            "Only cell lines whose panel_role is core can be ranked;\n"
-            "   observational ones are carried for reference.",
+            (
+                "Only cell lines whose panel_role is core can be ranked;\n"
+                "   observational ones are carried for reference."
+            ),
             "Higher auc means less sensitive.",
         ],
         tool_blocks=[
@@ -314,9 +322,11 @@ def _round_attention_attribution(rng, line, genes, sink_gene) -> Round:
         question=f"For cell line {line}: which gene did the model attend to most\n"
         f"when making this prediction?",
         rules=[
-            "A gene marked housekeeping_sink absorbs attention on every\n"
-            "   sample and carries no sample-specific signal; it cannot be\n"
-            "   the answer.",
+            (
+                "A gene marked housekeeping_sink absorbs attention on every\n"
+                "   sample and carries no sample-specific signal; it cannot be\n"
+                "   the answer."
+            ),
             "Rank on attn_sum, the distribution-shaped reduction.",
         ],
         tool_blocks=[
@@ -356,14 +366,16 @@ def _round_prediction_audit(rng, line, drug, pred, true) -> Round:
         question=f"For {line} and {drug}: report the absolute error between\n"
         f"predicted and observed auc, and whether the model agrees.",
         rules=[
-            "AGREES when the absolute error is within the tolerance in the\n"
-            "   schema table, DISAGREES otherwise.",
+            (
+                "AGREES when the absolute error is within the tolerance in the\n"
+                "   schema table, DISAGREES otherwise."
+            ),
             "Report the error to two decimal places.",
         ],
         tool_blocks=[
             (
-                f'db_lookup(table="predictions", select=["auc_pred", "auc_true"], '
-                f'where="cell_line=\'{line}\' and compound=\'{drug}\'")',
+                'db_lookup(table="predictions", select=["auc_pred", "auc_true"], '
+                + f'where="cell_line=\'{line}\' and compound=\'{drug}\'")',
                 tbl,
             ),
             ('schema_lookup(metric="auc")', sch),
@@ -377,6 +389,81 @@ def _round_prediction_audit(rng, line, drug, pred, true) -> Round:
     )
 
 
+@dataclass
+class ChainContext:
+    """Everything a round builder may need, assembled once per chain.
+
+    Passing a context object rather than a growing argument list means a new
+    task type can be added without touching :func:`build_chains` or any
+    existing builder.
+    """
+
+    rng: random.Random
+    drug: str
+    per_line: list[tuple[str, float]]
+    qc_failed: list[str]
+    roles: dict[str, str]
+    truth: dict[str, float]
+    attention: dict[str, list[tuple[str, float]]]
+    #: Answers from earlier rounds, keyed by task type. Later rounds depend on
+    #: these, exactly as the phenotyping chains do.
+    answers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def last_answer(self) -> str | None:
+        return next(reversed(self.answers.values()), None) if self.answers else None
+
+
+#: Round builders, in the order they are applied. Each takes a
+#: :class:`ChainContext` and returns a :class:`Round`, or ``None`` to skip
+#: itself when its inputs are unavailable.
+TASK_BUILDERS: list[tuple[str, Callable[[ChainContext], Round | None]]] = []
+
+
+def register_task(name: str):
+    """Register a round builder under ``name``.
+
+    Adding a task type is a decorator and a function; nothing else changes.
+    """
+
+    def decorator(fn):
+        TASK_BUILDERS.append((name, fn))
+        return fn
+
+    return decorator
+
+
+@register_task("sensitivity_ranking")
+def _build_sensitivity_ranking(ctx: ChainContext) -> Round | None:
+    return _round_sensitivity_ranking(ctx.rng, ctx.drug, ctx.per_line, ctx.qc_failed)
+
+
+@register_task("panel_restricted_rank")
+def _build_panel_restricted(ctx: ChainContext) -> Round | None:
+    return _round_panel_restricted(
+        ctx.rng, ctx.answers.get("sensitivity_ranking", "-"), ctx.per_line, ctx.roles
+    )
+
+
+@register_task("attention_attribution")
+def _build_attention_attribution(ctx: ChainContext) -> Round | None:
+    line = ctx.last_answer
+    genes = ctx.attention.get(line) if line else None
+    if not genes:
+        return None
+    sink = max(genes, key=lambda t: t[1])[0]
+    return _round_attention_attribution(ctx.rng, line, genes, sink)
+
+
+@register_task("prediction_audit")
+def _build_prediction_audit(ctx: ChainContext) -> Round | None:
+    line = ctx.answers.get("panel_restricted_rank") or ctx.last_answer
+    if line is None or line not in ctx.truth:
+        return None
+    pred = dict(ctx.per_line)[line]
+    return _round_prediction_audit(ctx.rng, line, ctx.drug, pred, ctx.truth[line])
+
+
 def build_chains(
     predictions,
     attention_by_line: dict[str, list[tuple[str, float]]] | None = None,
@@ -384,63 +471,63 @@ def build_chains(
     rounds_per_chain: int = 4,
     seed: int = 0,
     facility: str = "Ridgefield",
+    lines_per_chain: int = 6,
+    chain_prefix: str = "pmca",
 ) -> list[Chain]:
     """Build chains from a real prediction table and real captured attention.
 
-    ``predictions`` is a DataFrame with ``cell_line``, ``drug``, ``auc_true``,
-    ``auc_pred`` -- exactly what ``Paccmann_MCA_infer_improve.py`` writes.
-    ``attention_by_line`` maps a cell line to ``(gene, attn_sum)`` pairs from
-    ``drp_paccmann``; rounds needing it are skipped when it is absent.
+    ``predictions`` is a DataFrame with ``cell_line``, ``drug``, ``auc_true``
+    and ``auc_pred`` -- exactly what ``Paccmann_MCA_infer_improve.py`` writes.
+    ``attention_by_line`` maps a sample to ``(feature, attn_sum)`` pairs, as
+    :func:`load_attention_from_store` returns; rounds needing it skip
+    themselves when it is absent.
+
+    Rounds come from :data:`TASK_BUILDERS`, so the set of task types is
+    extensible without editing this function.
     """
     rng = random.Random(seed)
+    attention = attention_by_line or {}
     drugs = sorted(predictions["drug"].unique())
-    chains: list[Chain] = []
+    if not drugs:
+        return []
 
+    chains: list[Chain] = []
     for idx in range(n_chains):
         drug = drugs[idx % len(drugs)]
         sub = predictions[predictions["drug"] == drug]
-        if len(sub) < 6:
+        if len(sub) < lines_per_chain:
             continue
-        sub = sub.sample(n=min(6, len(sub)), random_state=seed + idx)
+        sub = sub.sample(n=lines_per_chain, random_state=seed + idx)
 
-        per_line = [(r.cell_line, float(r.auc_pred)) for r in sub.itertuples()]
+        rows = list(sub.itertuples())
+        per_line = [(r.cell_line, float(r.auc_pred)) for r in rows]
+        truth = {r.cell_line: float(r.auc_true) for r in rows}
 
-        # Void the apparent winner sometimes, so the QC rule is load-bearing
-        # rather than decorative.
-        low = min(per_line, key=lambda t: t[1])[0]
-        qc_failed = [low] if rng.random() < 0.6 else [per_line[-1][0]]
-
-        roles = {c: "core" for c, _ in per_line}
-        top = max(per_line, key=lambda t: t[1])[0]
-        if rng.random() < 0.6:
-            roles[top] = "observational"
+        ctx = ChainContext(
+            rng=rng,
+            drug=drug,
+            per_line=per_line,
+            qc_failed=_pick_qc_failures(rng, per_line),
+            roles=_assign_panel_roles(rng, per_line),
+            truth=truth,
+            attention=attention,
+        )
 
         rounds: list[Round] = []
-        r1 = _round_sensitivity_ranking(rng, drug, per_line, qc_failed)
-        rounds.append(r1)
+        for name, builder in TASK_BUILDERS:
+            if len(rounds) >= rounds_per_chain:
+                break
+            rnd = builder(ctx)
+            if rnd is None:
+                continue
+            rounds.append(rnd)
+            ctx.answers[name] = rnd.answer
 
-        if rounds_per_chain >= 2:
-            r2 = _round_panel_restricted(rng, r1.answer, per_line, roles)
-            rounds.append(r2)
-
-        line = rounds[-1].answer
-        if rounds_per_chain >= 3 and attention_by_line and line in attention_by_line:
-            genes = attention_by_line[line]
-            sink = max(genes, key=lambda t: t[1])[0]
-            rounds.append(_round_attention_attribution(rng, line, genes, sink))
-
-        if rounds_per_chain >= 4:
-            row = sub[sub.cell_line == line]
-            if len(row):
-                rounds.append(
-                    _round_prediction_audit(
-                        rng, line, drug,
-                        float(row.iloc[0].auc_pred), float(row.iloc[0].auc_true),
-                    )
-                )
+        if not rounds:
+            continue
 
         tier = "hard" if len(rounds) >= 4 else "medium"
-        chain = Chain(chain_id=f"pmca{idx}-chain-{idx:04d}-{tier}", rounds=rounds)
+        chain = Chain(chain_id=f"{chain_prefix}{idx}-chain-{idx:04d}-{tier}", rounds=rounds)
         chain.session = _SESSION.format(
             screen=100 + idx,
             facility=facility,
@@ -451,6 +538,27 @@ def build_chains(
         chains.append(chain)
 
     return chains
+
+
+def _pick_qc_failures(rng: random.Random, per_line) -> list[str]:
+    """Void a cell, usually the most sensitive one.
+
+    Voiding the apparent winner is what makes the QC rule load-bearing rather
+    than decorative: a model that ignores the quality gate gets it wrong.
+    """
+    lowest = min(per_line, key=lambda t: t[1])[0]
+    return [lowest] if rng.random() < 0.6 else [per_line[-1][0]]
+
+
+def _assign_panel_roles(rng: random.Random, per_line) -> dict[str, str]:
+    """Mark the least sensitive line observational, usually.
+
+    Same purpose: the naive ranking then names a line the rules exclude.
+    """
+    roles = {line: "core" for line, _ in per_line}
+    if rng.random() < 0.6:
+        roles[max(per_line, key=lambda t: t[1])[0]] = "observational"
+    return roles
 
 
 def add_tool_ranges(rows, tokenize: Callable[[str], list], history: bool = True):
