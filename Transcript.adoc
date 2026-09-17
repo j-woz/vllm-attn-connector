@@ -1,0 +1,770 @@
+= Session Transcript: Attention Capture from vLLM to Flowcept, and a Paccmann MCA Analogue
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+:experimental:
+
+[abstract]
+== Abstract
+
+A working session over the `vllm-attn-connector` repository. The thread starts as a
+one-line code-location question and escalates, question by question, into a full
+trace of the data path from a vLLM attention kernel to a MongoDB document -- then
+pivots to asking whether the same apparatus can be pointed at a completely different
+model (Paccmann MCA, a drug-sensitivity regressor) to produce comparable records.
+
+*Date:* 2026-09-17 +
+*Repository:* `/home/woz/proj/vllm-attn-connector` (branch `main`, clean at `874b260`) +
+*Vendored sources:* `deps/vllm` (at `1df336c3ba`), `deps/flowcept`, `deps/Paccmann_MCA`
+
+[NOTE]
+====
+*On this document.* Interpretive notes are set as admonition blocks and are the
+transcriber's commentary, not part of the original exchange. Verbatim user turns are
+quoted; assistant answers are summarised with their supporting evidence preserved.
+Every `file:line` citation below was verified against the working tree during the
+session.
+====
+
+== Session context
+
+The repository implements a two-part mechanism for capturing exact decode-time
+attention from vLLM and shipping it to Flowcept for provenance storage. At session
+start the tree was clean, with four commits:
+
+[source]
+----
+874b260 added tests
+f096087 capture attention statistics
+37d4709 vllm attention score proxy interceptor
+3b8e843 Initial commit
+----
+
+[TIP]
+====
+The commit titles telegraph the architecture before a single file is opened: an
+*interceptor* (the sensor) and *statistics capture* (the aggregation and export)
+are separate concerns, landed separately. The session's findings bear this out.
+====
+
+== Vendored sources (`deps/`)
+
+Three external checkouts under `deps/` supplied every fact verified in this session.
+They are *not* committed, *not* submodules, and *not* listed in `.gitignore` -- they
+exist only in the working tree, which means the revisions below are recorded nowhere
+in the repository itself. Reproducing the session's findings requires recreating them
+exactly.
+
+=== Revisions used
+
+[cols="1,3,2,1",options="header"]
+|===
+| Directory | Origin | Commit | Size
+
+| `deps/vllm`
+| `git@github.com:vllm-project/vllm.git`
+| `1df336c3bab8e2ac2eb3d325bd90e62b94656e9c` +
+  (branch `main`, nearest tag `proto-v0.3.0`)
+| 425M
+
+| `deps/flowcept`
+| `git@github.com:spotter-ai-genesis/flowcept.git`
+| `89bb09ac03fc3c55f9306776a5d2b307e32032c0` +
+  (branch `main`, untagged)
+| 111M
+
+| `deps/Paccmann_MCA`
+| `git@github.com:JDACS4C-IMPROVE/Paccmann_MCA.git`
+| `1960a092bab35b1585e7c5d9a66ee059a870aff9` +
+  (branch `*develop*`, nearest tag `v0.0.3-beta`)
+| 1.1M
+|===
+
+=== Recreating them
+
+[source,bash]
+----
+mkdir -p deps && cd deps
+
+git clone git@github.com:vllm-project/vllm.git
+git -C vllm checkout 1df336c3bab8e2ac2eb3d325bd90e62b94656e9c
+
+git clone git@github.com:spotter-ai-genesis/flowcept.git
+git -C flowcept checkout 89bb09ac03fc3c55f9306776a5d2b307e32032c0
+
+git clone git@github.com:JDACS4C-IMPROVE/Paccmann_MCA.git
+git -C Paccmann_MCA checkout 1960a092bab35b1585e7c5d9a66ee059a870aff9
+----
+
+To avoid the 425M vLLM history, substitute a shallow fetch:
+
+[source,bash]
+----
+git clone --filter=blob:none git@github.com:vllm-project/vllm.git
+----
+
+These are read-only reference checkouts. Nothing in `src/` imports from `deps/`:
+`pyproject.toml:10` declares `dependencies = []  # vllm and flowcept provided by the
+host environment`, so at runtime both come from the host environment, not from here.
+`deps/` exists to read and verify against, not to execute.
+
+=== Three traps
+
+Two of the three are not the obvious upstream::
+`deps/flowcept` points at `spotter-ai-genesis/flowcept`, a fork -- not ORNL's
+upstream Flowcept. Cloning the upstream instead may not contain
+`flowceptor/adapters/vllm/vllm_interceptor.py` at all, since that adapter is what
+this project's connector is written against. Likewise `deps/Paccmann_MCA` is checked
+out on `develop`, not the default branch.
+
+The vLLM pin is load-bearing::
+Everything in <<_exchange_3_verification_against_the_real_vllm_checkout>> -- the
+five confirmed assumptions and the one falsified comment -- is a statement about
+`1df336c3ba` specifically. On a different revision the line numbers move and the
+conclusions may not hold. The finding that `_backend_cls_path` sits at `cuda.py:182`
+rather than the `cuda.py:423` named in `probe.py`'s comment is itself evidence of how
+quickly these drift.
+
+Nothing records the pins::
+Because `deps/` is untracked, a fresh clone of this repository gives no indication
+which revisions the verification was performed against. This table is currently the
+only record. See open item 7.
+
+== Exchange 1: Locating `install_probe`
+
+[quote,user]
+____
+where is install_probe
+____
+
+A repository-wide grep found seven references but only one definition site. The
+public name is an alias:
+
+[source,python]
+----
+# src/vllm_attn_connector/__init__.py:13
+from .probe import REGISTRY, install as install_probe
+----
+
+The function itself is `install` at `src/vllm_attn_connector/probe.py:112`.
+
+[NOTE]
+.Interpretive note
+====
+The rename at the package boundary is deliberate, not incidental. Inside `probe.py`
+the verb `install` is unambiguous -- there is only one thing to install. Exported to
+users as `vllm_attn_connector.install_probe()`, it needs the noun back. This is a
+small signal that the package was designed with an external caller in mind, which
+the README and `tests/e2e_smoke.py` confirm by calling the public name.
+====
+
+== Exchange 2: How the probe connects to vLLM
+
+[quote,user]
+____
+how does it connect to vllm. do you need the vllm source
+____
+
+=== The connection mechanism
+
+Entirely through vLLM's public backend registry. The sequence in `install()`:
+
+. Import `register_backend` / `AttentionBackendEnum` from
+  `vllm.v1.attention.backends.registry` (`probe.py:121`).
+. Resolve the live backend class for the requested enum member -- default
+  `FLASH_ATTN` -- and take its impl via `get_impl_cls()` (`probe.py:134-139`).
+. Build two subclasses at runtime: `_ProbedImpl`, whose `forward` calls
+  `_capture(...)` then delegates to `super().forward(...)`; and `_ProbedBackend`,
+  which returns `_ProbedImpl` from `get_impl_cls()` (`probe.py:141-153`).
+. Rewrite `__name__` / `__qualname__` / `__module__` on both and inject them into
+  the module's `globals()` (`probe.py:155-164`), then call `register_backend`.
+. Captured decode queries land in the module-level `REGISTRY`, read later by the
+  connector half.
+
+Two design constraints were surfaced from the source comments:
+
+Timing:: `install()` must run before engine construction, because
+`_cached_get_attn_backend` is `@cache`-decorated and resolves the backend class
+exactly once.
+
+Why the impl, not a module hook:: `Attention.forward` is traced through by
+`torch.compile`; only the custom op `unified_attention_with_output` survives as a
+runtime node, and it dispatches `self.impl.forward(...)` dynamically. Overriding the
+impl therefore still fires under CUDA graphs, where an `nn.Module` forward hook
+would not.
+
+=== Do you need the source?
+
+No -- but vLLM must be *installed*, and it was not:
+
+[source]
+----
+ModuleNotFoundError: No module named 'vllm'
+----
+
+`pyproject.toml:10` is explicit: `dependencies = []  # vllm and flowcept provided by
+the host environment`. Every vLLM import in `probe.py` is wrapped in
+`try/except ImportError` with a `logger.warning` and a `return False`, so `install()`
+degrades quietly on a machine without it.
+
+[IMPORTANT]
+.Interpretive note
+====
+The distinction drawn here -- *not needing the source* versus *needing the package* --
+is the one that actually matters for this codebase, and it is load-bearing for
+everything that follows. The probe patches nothing and forks no kernel, but it is
+tightly coupled to vLLM's internal *layout*: module paths, enum members, a method
+signature, and one platform quirk. That coupling is invisible to a dependency
+resolver and therefore invisible to CI. It only shows up when a vLLM upgrade moves
+something.
+
+This is precisely the gap the user closes in the next turn.
+====
+
+== Exchange 3: Verification against the real vLLM checkout
+
+[quote,user]
+____
+the source is now in deps/vllm
+____
+
+A checkout appeared at `deps/vllm`, HEAD `1df336c3ba` ("[Perf][ROCm] Enable AITER
+QuickReduce + RMSNorm fusion (#48249)"). Each assumption in `probe.py` was checked
+against it.
+
+=== Confirmed
+
+[cols="2,3,2",options="header"]
+|===
+| Assumption | Evidence | Verdict
+
+| `register_backend(backend, class_path)` signature
+| `registry.py:273`; with non-`None` `class_path` it stores the string in
+  `_ATTN_OVERRIDES` and returns a no-op
+| Matches `probe.py:165`
+
+| `AttentionBackendEnum.FLASH_ATTN` exists
+| `registry.py:44`
+| OK
+
+| `.get_class()` and `FlashAttentionBackend.get_impl_cls()`
+| `registry.py:176`, `flash_attn.py:366`
+| OK
+
+| `forward` signature
+| `flash_attn.py:1165-1176` --
+  `(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None, output_block_scale=None)`
+| Probe's `(..., output=None, *args, **kwargs)` passthrough is correct; the trailing
+  two ride in `*args`
+
+| `num_actual_tokens` and `max_query_len` on the metadata
+| `flash_attn.py:463-464`
+| OK
+
+| `num_decode_tokens` is unreliable
+| `flash_attn.py:486` -- defaults to `0`
+| Corroborates the `_capture` comment
+|===
+
+A bonus finding: `flash_attn.py:548-551` notes that FA2 captures a CUDA graph
+specifically at `max_query_len=1`. The probe's choice of `max_query_len == 1` as its
+decode signal is therefore better supported by the source than the code comment
+claims.
+
+=== One stale comment
+
+`probe.py:155-159` asserts:
+
+[quote]
+____
+vLLM's platform re-derives the class path from the class object itself
+(`_backend_cls_path`, cuda.py:423)
+____
+
+`_backend_cls_path` still exists, but at `cuda.py:182`, and it is only reached on the
+*selection* paths (`cuda.py:477`, `cuda.py:546`) -- not on override resolution. An
+explicit override goes through `get_path()` → `resolve_obj_by_qualname(path)`
+(`registry.py:155-188`), which imports the literal string that was registered.
+
+The workaround remains necessary, for a different reason: `resolve_obj_by_qualname`
+must import `vllm_attn_connector.probe.ProbedFlashAttentionBackend`, so the class
+genuinely has to be reachable in module globals under that name. The
+`globals()[cls.__name__] = cls` loop is what guarantees that. Only the
+`__module__` / `__qualname__` rewrites have dropped from load-bearing to
+belt-and-braces.
+
+[WARNING]
+.Interpretive note
+====
+This is the session's one concrete defect, and it is instructive in kind. The *code*
+is correct; the *comment* is wrong. A future maintainer reading `probe.py:155-159`
+would go to `cuda.py:423`, find unrelated code, and reasonably conclude the whole
+block is obsolete cargo -- then delete the `globals()` injection and break override
+resolution in a way that only manifests at engine construction.
+
+Stale comments that justify non-obvious code are more dangerous than no comments at
+all, because they actively license the wrong edit.
+
+An offer to correct the comment was made and left unanswered; see
+<<open-items,Open items>>.
+====
+
+== Exchange 4: The export path to Flowcept
+
+[quote,user]
+____
+how does the connector export data from vllm to flowcept. flowcept is in deps
+____
+
+Exactly one Flowcept import exists in the whole of `src/` (`connector.py:431`). The
+full chain:
+
+.Stage 1 -- Setup, `_WorkerSide.__init__` (`connector.py:431-434`)
+[source,python]
+----
+from flowcept.flowceptor.adapters.vllm.vllm_interceptor import VLLMInterceptor
+self._interceptor = VLLMInterceptor.get_instance()
+self._interceptor.start(bundle_exec_id=workflow_id)
+----
+
+Singleton, started once per worker process. `start()` brings up the MQ DAO;
+`send_workflow_message` raises if it was never called
+(`base_interceptor.py:146-148`).
+
+.Stage 2 -- Run-level record (`connector.py:513`)
+Rank 0 only. `send_model_workflow(workflow_id, conf, parent_workflow_id=...)` builds
+a `WorkflowObject` carrying the model config -- crucially the tokenizer identity,
+without which the `prompt_token_ids` on every later task cannot be decoded.
+`send_workflow_message` dedupes on `workflow_id` via `_saved_workflows`, so
+re-registration is a silent no-op.
+
+.Stage 3 -- Per-request record, `emit_finished` → `_emit` (`connector.py:740-851`)
+Driven by vLLM's `KVConnector` request-finished hook. Per finished request: pop the
+`_RequestState`, `st.event.synchronize()`, then emit *one task per KV-cache group*,
+keyed `f"{req_id}:g{group.gid}"`.
+
+The GPU→host conversion happens inline -- every tensor goes
+`.double().round(decimals=FLOAT_DECIMALS).tolist()`. Nothing tensor-shaped crosses
+into Flowcept.
+
+The payload splits in two:
+
+`series`:: numeric arrays. Flat per-token (`attn_sum`, `attn_peak`, length `n_keys`)
+and matrices (`topk_pos`, `topk_head`, the `AGG_FIELDS`, `topk_residual`,
+`segments`), shaped `[G, k]` for `G` decode steps.
+
+`metadata`:: everything needed to interpret those arrays without guessing --
+`matrix_shape`, `matrix_fields`, `head_code`, `no_entry_sentinel`,
+`segments_layout`, per-head/per-layer statistics, and provenance such as `restarts`
+and `decode_steps_dropped`.
+
+.Stage 4 -- Adapter (`vllm_interceptor.py:113-194`)
+`capture_request` → `callback` → `prepare_task_msg` → `intercept(task_msg.to_dict())`.
+
+`prepare_task_msg` distinguishes flat series from matrices by peeking at `v[0]`. Only
+flat series must agree on length, and that agreed length becomes
+`num_computed_tokens`; matrices are checked only for raggedness.
+
+.Stage 5 -- Out (`base_interceptor.py:184-186`)
+[source,python]
+----
+def intercept(self, obj_msg): self._mq_dao.buffer.append(obj_msg)
+----
+
+Fire-and-forget. Flowcept's flush thread drains the buffer onward.
+`connector.py:861` calls `self._interceptor.stop()`, which is what guarantees the
+tail is flushed.
+
+=== Two observations raised
+
+TP guard is tautological:: `connector.py:747` reads
+`if self._tp_rank == 0 or self._tp_size > 1:`, but `_emit` itself returns at line 756
+when `self._tp_rank != 0`. Non-zero ranks enter `_emit`, run `st.event.synchronize()`
+and compute `n_keys`, then bail. Net behaviour is correct -- only rank 0 emits -- but
+the guard *reads* as though non-rank-0 emission were intended. It could be
+`if self._tp_rank == 0:` unless the sync on other ranks is deliberate.
+
+Interceptor started on every rank:: `connector.py:434` runs on all ranks, including
+those that never emit. Each spins up an MQ connection that sends nothing. Harmless,
+but it explains idle MQ clients scaling with TP degree.
+
+[NOTE]
+.Interpretive note
+====
+Both observations are the same species: *behaviour is right, intent is unreadable*.
+Neither is a bug and neither was presented as one. The value is in flagging places
+where a future reader must reverse-engineer whether something is load-bearing --
+the same failure mode as the stale comment in Exchange 3, arrived at from a
+different direction.
+
+Note also the deliberate type isolation across the boundary: the connector imports
+no Flowcept dataclass and Flowcept imports no torch. The two halves share only
+primitives. This is what makes the Paccmann pivot in Exchange 8 tractable at all.
+====
+
+== Exchange 5: What type crosses the boundary
+
+[quote,user]
+____
+so what is the type of object passed from the connector to flowcept
+____
+
+[NOTE]
+The user ran `/effort` immediately before this turn, setting effort to *medium*.
+The answers from here on are correspondingly tighter.
+
+The answer is that the type changes three times, and at the boundary itself there is
+no object -- only kwargs.
+
+.At the call boundary (`connector.py:813`)
+[cols="1,2",options="header"]
+|===
+| Argument | Type
+
+| `workflow_id`, `request_id`, `activity` | `str`
+| `series` | `dict[str, list]` -- values are `list[float]` (flat, per prompt token) or
+  `list[list[float\|int]]` (matrices, `[G, k]`)
+| `prompt_token_ids` | `list[int]`
+| `started_at` | `float`
+| `metadata` | `dict[str, Any]`
+|===
+
+.Inside the adapter
+`prepare_task_msg` packs those into a `TaskObject`
+(`flowcept/commons/flowcept_dataclasses/task_object.py:18`): `task_id = request_id`,
+`activity_id`/`subtype = activity`, `status = Status.FINISHED`, `used = {...}`,
+`generated = series`, `custom_metadata = metadata`. The run-level call builds a
+`WorkflowObject` instead.
+
+.On the wire
+`callback` ends with `self.intercept(task_msg.to_dict())`. `to_dict`
+(`task_object.py:220`) walks `__dict__`, drops `None` fields, unwraps enums to
+`.value`. What reaches the buffer is a JSON-serialisable `dict`.
+
+*Primitives → `TaskObject` → `dict`.*
+
+== Exchange 6: Is `TaskObject` the storage format?
+
+[quote,user]
+____
+so flowcept stores TaskObjects?
+____
+
+No. `TaskObject` never leaves the producer process -- it is a transient builder.
+
+. `prepare_task_msg` constructs it.
+. `callback` calls `to_dict()` and appends the *dict* (`base_interceptor.py:186`).
+  The `TaskObject` is garbage after that line.
+. The dict is serialised onto the MQ (Redis/Kafka), crossing a process boundary.
+. `DocumentInserter` receives it still as a dict and calls
+  `TaskObject.enrich_task_dict(message)` (`document_inserter.py:149`) -- a static
+  helper that mutates the *dict*, not a rehydration.
+. It hands the list to `dao.insert_and_update_many_tasks(buffer, TaskObject.task_id_field())`
+  (`document_inserter.py:111`), signature `(doc_list: List[Dict], indexing_key=None)`
+  (`mongodb_dao.py:265`).
+
+`TaskObject` survives in the consumer only as a source of field-name constants:
+`task_id_field()` and `workflow_id_field()` build the indexes
+(`mongodb_dao.py:98-101`), with `task_id` *unique* on the tasks collection.
+
+[IMPORTANT]
+.Interpretive note
+====
+The unique index is the detail that repays the whole excavation. `_emit` keys tasks
+as `f"{req_id}:g{group.gid}"` (`connector.py:815`). That `:g{gid}` suffix is not
+cosmetic -- it is what prevents multiple KV-cache groups from colliding on the unique
+`task_id` index and silently overwriting one another.
+
+A reader who assumed the suffix was for human legibility, and dropped it during a
+refactor, would lose all but one group's data per request with no error raised.
+Chasing the dataclass question to the actual storage layer is what exposed the
+constraint.
+====
+
+== Exchange 7: Document granularity
+
+[quote,user]
+____
+so there is 1 mongodb document per LLM inference?
+____
+
+Per finished request *per KV-cache group* -- which for most models is 1.
+
+`_emit` loops `for gi, group in enumerate(self._scored)`, calling `capture_request`
+once per iteration (`connector.py:813`). `self._scored` is built in
+`register_kv_caches` from `kv_cache_config.kv_cache_groups`, retaining only groups
+with at least one layer whose layout resolved.
+
+* Plain full-attention model → one group → one document.
+* Hybrid / sliding-window model (interleaved global + local layers) → several groups
+  → one document per group per request.
+
+.What does *not* multiply the count
+Decode steps:: All `G` steps are packed into matrices inside the single document.
+One doc per request, not per token.
+Tensor parallelism:: Only `tp_rank == 0` emits (`connector.py:756`).
+Layers:: Aggregated over `(layer, head)` within the group before emission.
+
+.Zero documents
+`connector.py:743-745` -- state never created, `colsum is None`, or `steps == 0`
+(e.g. a request that finished without a captured decode step). The `req_id` still
+enters `_emitted`, so the scheduler side treats it as handled either way.
+
+Separately: one `WorkflowObject` document per run.
+
+== Exchange 8: A Paccmann MCA analogue
+
+[quote,user]
+____
+what is the equivalent in the Paccmann source that we could attach to with the
+connector with a few code changes. can we attach the connector to the MCA model
+layers and produce something similar at inference time?
+____
+
+Answer: yes, and it is substantially *easier* than the vLLM case, because the hard
+half of the existing design does not apply.
+
+=== Why the difficulty collapses
+
+The vLLM work needed two extension points because decode queries are transient: they
+never enter the KV cache, `torch.compile` erases `Attention.forward`, and CUDA graphs
+defeat module hooks. Hence the backend-impl override plus `layout.py` / `kernels.py`
+to re-derive scores against cached K.
+
+MCA has none of this. It is a single-pass encoder-regressor, eager mode, no KV cache,
+no autoregression. *The attention weights are already materialised and already
+returned* -- and then discarded.
+
+=== Attach points, ranked
+
+[[attach-1]]
+==== 1. `prediction_dict` -- `paccmann_predictor/models/paccmann.py:271-283`
+
+[source,python]
+----
+prediction_dict.update({
+    'gene_attention': gene_alphas,                   # [bs, 2128]
+    'smiles_attention': smiles_attention_weights,    # [bs, 560]
+    'IC50': predictions, ...
+})
+----
+
+Gated on `if not self.training`, so live exactly on the inference path. The built-in
+analogue of `REGISTRY`.
+
+Caveat: `smiles_attention_weights` is `torch.mean(...)` over the head axis
+(`paccmann.py:273-279`), which *destroys* the per-head structure the vLLM payload
+preserves (`topk_head`, `head_code`, `head_entropy`). The raw `smiles_alphas` list --
+16 tensors, `multiheads=[4,4,4,4]` → 4 layers × 4 heads -- exists at
+`paccmann.py:253` and is thrown away. Retaining it is a one-line change.
+
+[[attach-2]]
+==== 2. `ContextAttentionLayer.forward` -- `paccmann_predictor/utils/layers.py:210`
+
+The true probe analogue. `alphas` is computed at line 232, shape `[bs, T]`. With no
+`torch.compile` in the path, a plain forward hook works -- the very thing that would
+not work in vLLM:
+
+[source,python]
+----
+for name, m in model.named_modules():
+    if isinstance(m, ContextAttentionLayer):
+        m.register_forward_hook(lambda mod, inp, out, n=name: REGISTRY.put(n, out[1]))
+----
+
+Zero edits to Paccmann source, matching the project's existing "no vLLM source is
+patched" stance.
+
+[[attach-3]]
+==== 3. The inference loop -- `test_paccmann.py:170-176`
+
+[source,python]
+----
+y_hat, pred_dict = model(torch.squeeze(smiles.to(device)), gep.to(device))
+predictions.append(y_hat)
+----
+
+`pred_dict` is bound and never used. The attention data is computed on every
+inference batch and dropped on the floor. This is where `emit_finished` belongs.
+
+=== Schema mapping
+
+[cols="2,3",options="header"]
+|===
+| vLLM connector | MCA equivalent
+
+| request-finished hook | end of each batch, `test_paccmann.py:170`
+| one doc per `{req_id}:g{gid}` | one doc per sample; `:g0` SMILES, `:g1` gene
+| `prompt_token_ids` | the `smiles` row of token ids, decoded via `smiles_language`
+| workflow `conf` with tokenizer identity | `params` with `smiles_language_filepath`,
+  `smiles_vocabulary_size`, `modelpath`
+| `attn_sum` / `attn_peak` over (layer, head) | sum / max of `alphas` over the 16 heads,
+  per SMILES token
+| `head_code = layer * H + head` | `ind = multiheads[0] * layer + head`, already
+  computed at `paccmann.py:248`
+| `matrix_shape [G, k]` | *G = 1* -- no decode loop
+|===
+
+=== Stated limitations
+
+Two were raised explicitly rather than glossed:
+
+No temporal axis:: The vLLM records capture how attention *evolves across
+generation*. MCA yields one static distribution per prediction. `topk_residual`,
+`decode_steps_dropped`, `wins_first_step` vs `wins_later_steps`, and the
+preemption/restart logic have no counterpart.
+
+Different quantity:: MCA attention is additive / Bahdanau-style --
+`tanh(W_r·ref + W_c·ctx) → Linear → softmax` (`layers.py:199-233`) -- not
+`softmax(qKᵀ/√d)`. The `metric_reference` string would have to change; the numbers
+are not the same measurement.
+
+=== Scope estimate
+
+Reusable as-is:: `VLLMInterceptor`. Its own docstring states "the adapter imposes no
+meaning on the series", and `activity` exists so that multiple connectors can share
+one store. Only the class name is vLLM-flavoured.
+
+Not reusable:: `probe.py`, `layout.py`, `kernels.py` -- all solve problems MCA does
+not have. 560 SMILES tokens × 16 heads is trivial to move; full vectors can be
+emitted and `_segment_plan` / top-k skipped. Genes at 2128 are the only place top-k
+might earn its keep.
+
+Estimated: one hook registration, one emit function (~60 lines), two call sites in
+`test_paccmann.py`, optionally one line in `paccmann.py`.
+
+[TIP]
+.Interpretive note
+====
+The pivot here is the session's real payoff, and it only works *because* of
+Exchanges 4-7. Knowing that the boundary carries primitives -- not torch tensors, not
+a vLLM-specific dataclass -- is what makes "point it at a completely different model"
+a sixty-line proposition rather than a rewrite.
+
+Note too that the difficulty inverts. In vLLM the sensor is hard (transient queries,
+compiled graphs) and the schema is natural. In MCA the sensor is trivial (the weights
+are handed to you) but the schema is a poor fit: the `[G, k]` matrices that carry the
+design's richest signal collapse to `G = 1`.
+
+The honest framing offered was that this yields *which SMILES tokens and which genes
+mattered for this prediction* -- genuinely useful provenance -- but not the temporal
+attention dynamics the vLLM path was built to capture. Same pipeline, same store,
+materially different scientific claim.
+====
+
+== Exchange 9: Implementation request (interrupted)
+
+[quote,user]
+____
+yes. put it in a new mca_probe.py mca_layout.py mcs_kernels.py
+____
+
+Investigation began -- reading `MCA.__init__` (`paccmann.py:95-215`) to establish
+module naming, head enumeration, and sequence dimensions -- and *the user interrupted
+before any file was written*.
+
+Facts gathered before the interrupt:
+
+* `context_attention_layers` is an `nn.Sequential` with `OrderedDict` keys
+  `f'context_attention_{layer}_head_{head}'` (`paccmann.py:166-177`) -- so
+  `named_modules()` yields stable, parseable names carrying both indices. A hook-based
+  probe needs no separate index bookkeeping.
+* `ContextAttentionLayer` is constructed with `reference_sequence_length=42` and the
+  inline comment "Can be anything since context is only 1D (omic)" -- a dead
+  parameter on this path.
+* `smiles_hidden_sizes = [smiles_embedding_size] + filters` (`paccmann.py:164`), so
+  the reference hidden size differs per layer while the sequence axis does not.
+* Defaults: `number_of_genes = 2128`, `smiles_padding_length = 560`,
+  `filters = [64,64,64]`, `multiheads = [4,4,4,4]`, `smiles_attention_size = 64`.
+
+[CAUTION]
+.Interpretive note
+====
+Two open questions were live at the moment of interruption, neither resolved:
+
+. *Filename.* The user wrote `mcs_kernels.py` while the other two are `mca_`. Almost
+  certainly a typo for `mca_kernels.py`, but it was never confirmed.
+. *Where emission lives.* The vLLM design splits sensor (`probe.py`) from
+  exporter (`connector.py`). The user named three files and no `mca_connector.py`.
+  Folding the Flowcept emission into `mca_probe.py` conflates the two roles; adding a
+  fourth file exceeds the instruction. This needed asking, not guessing.
+
+The interrupt landed before either could be raised. Both should be settled before
+code is written -- see below.
+====
+
+[[open-items]]
+== Open items
+
+[cols="1,4,1",options="header"]
+|===
+| # | Item | Status
+
+| 1
+| Stale comment at `probe.py:155-159` cites `_backend_cls_path, cuda.py:423`; the
+  function is now at `cuda.py:182` and is not on the override-resolution path. The
+  `globals()` injection is still required, but for a different reason. An offer to
+  rewrite the comment was made.
+| Unanswered
+
+| 2
+| Tautological TP guard at `connector.py:747` -- `if self._tp_rank == 0 or self._tp_size > 1:`
+  duplicated by the early return at `connector.py:756`. Simplify, unless the
+  `event.synchronize()` on non-zero ranks is intentional.
+| Raised, not actioned
+
+| 3
+| `VLLMInterceptor.start()` runs on every TP rank (`connector.py:434`), including
+  ranks that never emit.
+| Raised, not actioned
+
+| 4
+| Filename: `mcs_kernels.py` vs `mca_kernels.py`.
+| Needs confirmation
+
+| 5
+| Placement of the Flowcept emission half for the MCA path (fold into `mca_probe.py`,
+  or add `mca_connector.py`).
+| Needs decision
+
+| 6
+| The three MCA files themselves.
+| Not started -- interrupted
+
+| 7
+| `deps/` is untracked, not submodules, not gitignored, so the three pinned revisions
+  are recorded nowhere in the repository. Decide between adding `deps/` to
+  `.gitignore` (pins live only in prose) or registering submodules (pins tracked by
+  git, at the cost of a 425M vLLM checkout in the clone path). Until then a
+  `git add -A` will trip over the nested `.git` directories.
+| Needs decision
+|===
+
+== Method note
+
+Every claim in this session was checked against the vendored sources rather than
+recalled. That mattered three times:
+
+* `deps/vllm` at `1df336c3ba` confirmed five assumptions and falsified one comment
+  (Exchange 3).
+* `deps/flowcept` showed that `TaskObject` is a builder, not a storage format,
+  overturning the premise of the question asked (Exchange 6).
+* `deps/Paccmann_MCA` showed `pred_dict` is already computed and discarded at
+  `test_paccmann.py:171`, which is what made the sixty-line estimate credible rather
+  than speculative (Exchange 8).
+
+[NOTE]
+.Interpretive note
+====
+The arc is worth naming. Four consecutive user turns -- "how does it export", "what
+type", "does it store TaskObjects", "one document per inference" -- each drilled one
+level past the previous answer. None was a correction; each took a stated fact and
+asked what it implied downstream.
+
+That pattern is what surfaced the unique-index constraint on `task_id`, and that
+constraint is what makes the `:g{gid}` suffix legible as a correctness requirement
+rather than a formatting choice. The Paccmann question in Exchange 8 then arrives
+with all the necessary groundwork already laid.
+====
