@@ -253,7 +253,7 @@ class _RequestState:
                  "prompt_len", "steps", "dropped", "prompt_token_ids", "event", "started",
                  "seen_computed", "restarts", "k", "plan", "seg_idx", "seg_live",
                  "seg_want", "seg_kmax", "ranges", "n_keys", "owner", "head",
-                 "winner", "lsum", "lwins", "hent", "hdev", "hcnt", "hpos", "hval", "hmass")
+                 "lsum", "lwins", "hent", "hdev", "hcnt", "hpos", "hval", "hmass")
 
     def __init__(self, prompt_token_ids: list[int] | None):
         self.blocks: list[int] = []
@@ -281,7 +281,6 @@ class _RequestState:
         self.n_keys = 0
         self.owner = None
         self.head = None
-        self.winner = None
         self.lsum = None
         self.lwins = None
         self.hent = None
@@ -341,11 +340,7 @@ class _RequestState:
         # and may differ, so a merely-zeroed buffer of the old width would not fit.
         # Width must track n_keys: a restart refreezes the plan against a
         # possibly different prompt length.
-        if self.winner is not None and self.winner.shape[1] < n_keys:
-            self.winner = None
-        if layer_stats and self.winner is None:
-            self.winner = torch.full((groups, max(256, n_keys)), -1,
-                                     dtype=torch.int32, device=device)
+        if layer_stats and self.lwins is None:
             self.lsum = torch.zeros((groups, n_layers), dtype=torch.float64,
                                     device=device)
             # [bucket, groups, layer*heads]: bucket 0 = the first decode token,
@@ -387,7 +382,7 @@ class _RequestState:
     def reset_buffers(self) -> None:
         # Drop, not zero: a restart recomputes the selection plan, so the
         # per-step buffers may need a different width.
-        self.pos = self.val = self.resid = self.winner = None
+        self.pos = self.val = self.resid = None
         self.owner = self.head = None
         self.hpos = self.hval = None
         self.plan = []
@@ -718,12 +713,23 @@ class _WorkerSide:
                     st.colsum[gi, 0, :n_keys] += row[0]
                     torch.maximum(st.colsum[gi, 1, :n_keys], row[1],
                                   out=st.colsum[gi, 1, :n_keys])
-                    if st.winner is not None:
-                        w = st.winner[gi, :n_keys]
+                    if st.lwins is not None:
+                        # Which (layer, head) owned the max at each prefill
+                        # position this step, bucketed as first decode token (0)
+                        # against all later ones (1). The split is there to test
+                        # whether a head subset chosen on step 0 still holds for
+                        # the rest of the generation.
+                        #
+                        # Reads st.owner, which the layer loop above maintains.
+                        # This used to read a separate st.winner buffer that was
+                        # allocated, reset and never written, so both counters
+                        # were silently always zero -- a full-length array of
+                        # zeros rather than an error, which reads as "every
+                        # layer ties" and ranks them by index.
+                        w = st.owner[gi, :n_keys]
                         b = 0 if g_idx == 0 else 1
                         st.lwins[b, gi] += torch.bincount(
                             w[w >= 0].long(), minlength=st.lwins.shape[2]).double()
-                        w.fill_(-1)
                     if k:
                         # Select on the MAX aggregation: a mean over every
                         # (layer, head) pair buries whichever head is doing the
