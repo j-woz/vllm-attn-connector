@@ -1,0 +1,3721 @@
+chain_id,round_no,task_type,prompt,tool_ranges,correct_answer,explanation
+pmca0-chain-0000-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 100 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_1005
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_1005'"")
+    predicted AUC for Drug_1005, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000544  0.8658  
+    ACH-000111  0.8669  
+    ACH-000756  0.8664  
+    ACH-000260  0.8667  
+    ACH-000838  0.8661  
+    ACH-000109  0.8668  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_1005' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000109  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000544,(depends on: -; lowest usable auc is 0.8658 on ACH-000544 -> ACH-000544)
+pmca0-chain-0000-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000544  0.8658    0.8658  
+    ACH-000111  0.8669    0.8669  
+    ACH-000756  0.8664    0.8664  
+    ACH-000260  0.8667    0.8667  
+    ACH-000838  0.8661    0.8661  
+    ACH-000109  0.8668    0.8668  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000544  core      
+    ACH-000111  core      
+    ACH-000756  core      
+    ACH-000260  core      
+    ACH-000838  core      
+    ACH-000109  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000111,(depends on: round 1 answer ACH-000544; highest core-panel auc is 0.8669 on ACH-000111 -> ACH-000111)
+pmca0-chain-0000-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000111: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000111"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9993    1.3990   
+    RPUSD3   0.0006    0.0008   
+    SPATA32  0.0001    0.0002   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000111; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca0-chain-0000-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000111 and Drug_1005: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000111' and compound='Drug_1005'"")
+    model prediction against the observed value.
+    cell_line   compound   auc_pred  auc_true
+    ----------  ---------  --------  --------
+    ACH-000111  Drug_1005  0.8669    0.9137  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.05; AGREES,"(depends on: round 3; |0.8669 - 0.9137| = 0.0468, tolerance 0.10 -> 0.05; AGREES; no complications at this tier)"
+pmca1-chain-0001-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 101 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_1040
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_1040'"")
+    predicted AUC for Drug_1040, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000681  0.8322  
+    ACH-000967  0.8324  
+    ACH-000052  0.8323  
+    ACH-000595  0.8322  
+    ACH-000372  0.8323  
+    ACH-000965  0.8323  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_1040' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000681  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000595,(depends on: -; lowest usable auc is 0.8322 on ACH-000595 -> ACH-000595; ablations: ignoring the QC table gives ACH-000681)
+pmca1-chain-0001-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000681  0.8322    0.8322  
+    ACH-000967  0.8324    0.8324  
+    ACH-000052  0.8323    0.8323  
+    ACH-000595  0.8322    0.8322  
+    ACH-000372  0.8323    0.8323  
+    ACH-000965  0.8323    0.8323  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000681  core         
+    ACH-000967  observational
+    ACH-000052  core         
+    ACH-000595  core         
+    ACH-000372  core         
+    ACH-000965  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000052,"(depends on: round 1 answer ACH-000595; highest core-panel auc is 0.8323 on ACH-000052 -> ACH-000052; ablations: ranking without the panel table gives ACH-000967, which is observational)"
+pmca1-chain-0001-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000052: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000052"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9995    1.3993   
+    RPUSD3   0.0004    0.0006   
+    SPATA32  0.0001    0.0002   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000052; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca1-chain-0001-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000052 and Drug_1040: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000052' and compound='Drug_1040'"")
+    model prediction against the observed value.
+    cell_line   compound   auc_pred  auc_true
+    ----------  ---------  --------  --------
+    ACH-000052  Drug_1040  0.8323    0.9527  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.12; DISAGREES,"(depends on: round 3; |0.8323 - 0.9527| = 0.1204, tolerance 0.10 -> 0.12; DISAGREES; no complications at this tier)"
+pmca2-chain-0002-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 102 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_1087
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_1087'"")
+    predicted AUC for Drug_1087, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000987  0.6154  
+    ACH-000997  0.6163  
+    ACH-000226  0.6164  
+    ACH-000118  0.6135  
+    ACH-000149  0.6152  
+    ACH-000147  0.6152  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_1087' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000118  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000149,(depends on: -; lowest usable auc is 0.6152 on ACH-000149 -> ACH-000149; ablations: ignoring the QC table gives ACH-000118)
+pmca2-chain-0002-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000987  0.6154    0.6154  
+    ACH-000997  0.6163    0.6163  
+    ACH-000226  0.6164    0.6164  
+    ACH-000118  0.6135    0.6135  
+    ACH-000149  0.6152    0.6152  
+    ACH-000147  0.6152    0.6152  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000987  core         
+    ACH-000997  core         
+    ACH-000226  observational
+    ACH-000118  core         
+    ACH-000149  core         
+    ACH-000147  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000997,"(depends on: round 1 answer ACH-000149; highest core-panel auc is 0.6163 on ACH-000997 -> ACH-000997; ablations: ranking without the panel table gives ACH-000226, which is observational)"
+pmca2-chain-0002-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000997: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000997"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9981    1.3973   
+    RPUSD3   0.0013    0.0019   
+    SPATA32  0.0006    0.0008   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000997; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca2-chain-0002-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000997 and Drug_1087: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000997' and compound='Drug_1087'"")
+    model prediction against the observed value.
+    cell_line   compound   auc_pred  auc_true
+    ----------  ---------  --------  --------
+    ACH-000997  Drug_1087  0.6163    0.7682  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.15; DISAGREES,"(depends on: round 3; |0.6163 - 0.7682| = 0.1519, tolerance 0.10 -> 0.15; DISAGREES; no complications at this tier)"
+pmca3-chain-0003-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 103 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_1127
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_1127'"")
+    predicted AUC for Drug_1127, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000954  0.2041  
+    ACH-000570  0.2039  
+    ACH-000501  0.2040  
+    ACH-000330  0.2032  
+    ACH-000994  0.2039  
+    ACH-000270  0.2048  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_1127' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000270  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000330,(depends on: -; lowest usable auc is 0.2032 on ACH-000330 -> ACH-000330)
+pmca3-chain-0003-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000954  0.2041    0.2041  
+    ACH-000570  0.2039    0.2039  
+    ACH-000501  0.2040    0.2040  
+    ACH-000330  0.2032    0.2032  
+    ACH-000994  0.2039    0.2039  
+    ACH-000270  0.2048    0.2048  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000954  core         
+    ACH-000570  core         
+    ACH-000501  core         
+    ACH-000330  core         
+    ACH-000994  core         
+    ACH-000270  observational
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000954,"(depends on: round 1 answer ACH-000330; highest core-panel auc is 0.2041 on ACH-000954 -> ACH-000954; ablations: ranking without the panel table gives ACH-000270, which is observational)"
+pmca3-chain-0003-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000954: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000954"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9990    1.3987   
+    RPUSD3   0.0007    0.0010   
+    SPATA32  0.0002    0.0003   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    GGH      0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000954; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca3-chain-0003-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000954 and Drug_1127: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000954' and compound='Drug_1127'"")
+    model prediction against the observed value.
+    cell_line   compound   auc_pred  auc_true
+    ----------  ---------  --------  --------
+    ACH-000954  Drug_1127  0.2041    0.4804  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.28; DISAGREES,"(depends on: round 3; |0.2041 - 0.4804| = 0.2763, tolerance 0.10 -> 0.28; DISAGREES; no complications at this tier)"
+pmca4-chain-0004-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 104 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_1279
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_1279'"")
+    predicted AUC for Drug_1279, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000943  0.8492  
+    ACH-000484  0.8497  
+    ACH-000657  0.8498  
+    ACH-000997  0.8501  
+    ACH-000987  0.8498  
+    ACH-000054  0.8496  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_1279' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000943  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000054,(depends on: -; lowest usable auc is 0.8496 on ACH-000054 -> ACH-000054; ablations: ignoring the QC table gives ACH-000943)
+pmca4-chain-0004-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000943  0.8492    0.8492  
+    ACH-000484  0.8497    0.8497  
+    ACH-000657  0.8498    0.8498  
+    ACH-000997  0.8501    0.8501  
+    ACH-000987  0.8498    0.8498  
+    ACH-000054  0.8496    0.8496  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000943  core         
+    ACH-000484  core         
+    ACH-000657  core         
+    ACH-000997  observational
+    ACH-000987  core         
+    ACH-000054  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000657,"(depends on: round 1 answer ACH-000054; highest core-panel auc is 0.8498 on ACH-000657 -> ACH-000657; ablations: ranking without the panel table gives ACH-000997, which is observational)"
+pmca4-chain-0004-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000657: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000657"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9980    1.3972   
+    RPUSD3   0.0012    0.0017   
+    SPATA32  0.0008    0.0011   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    CEP350   0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000657; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca4-chain-0004-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000657 and Drug_1279: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000657' and compound='Drug_1279'"")
+    model prediction against the observed value.
+    cell_line   compound   auc_pred  auc_true
+    ----------  ---------  --------  --------
+    ACH-000657  Drug_1279  0.8498    0.9241  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.07; AGREES,"(depends on: round 3; |0.8498 - 0.9241| = 0.0743, tolerance 0.10 -> 0.07; AGREES; no complications at this tier)"
+pmca5-chain-0005-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 105 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_1326
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_1326'"")
+    predicted AUC for Drug_1326, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000784  0.7456  
+    ACH-000359  0.7454  
+    ACH-000523  0.7474  
+    ACH-000120  0.7470  
+    ACH-000851  0.7463  
+    ACH-000662  0.7458  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_1326' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000662  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000359,(depends on: -; lowest usable auc is 0.7454 on ACH-000359 -> ACH-000359)
+pmca5-chain-0005-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000784  0.7456    0.7456  
+    ACH-000359  0.7454    0.7454  
+    ACH-000523  0.7474    0.7474  
+    ACH-000120  0.7470    0.7470  
+    ACH-000851  0.7463    0.7463  
+    ACH-000662  0.7458    0.7458  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000784  core         
+    ACH-000359  core         
+    ACH-000523  observational
+    ACH-000120  core         
+    ACH-000851  core         
+    ACH-000662  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000120,"(depends on: round 1 answer ACH-000359; highest core-panel auc is 0.7470 on ACH-000120 -> ACH-000120; ablations: ranking without the panel table gives ACH-000523, which is observational)"
+pmca5-chain-0005-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000120: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000120"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9992    1.3988   
+    RPUSD3   0.0006    0.0009   
+    SPATA32  0.0002    0.0003   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    CEP350   0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000120; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca5-chain-0005-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000120 and Drug_1326: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000120' and compound='Drug_1326'"")
+    model prediction against the observed value.
+    cell_line   compound   auc_pred  auc_true
+    ----------  ---------  --------  --------
+    ACH-000120  Drug_1326  0.7470    0.7912  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.04; AGREES,"(depends on: round 3; |0.7470 - 0.7912| = 0.0442, tolerance 0.10 -> 0.04; AGREES; no complications at this tier)"
+pmca6-chain-0006-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 106 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_1507
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_1507'"")
+    predicted AUC for Drug_1507, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000393  0.8528  
+    ACH-000018  0.8528  
+    ACH-000544  0.8528  
+    ACH-000740  0.8528  
+    ACH-000670  0.8528  
+    ACH-000716  0.8528  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_1507' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000393  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000018,(depends on: -; lowest usable auc is 0.8528 on ACH-000018 -> ACH-000018; ablations: ignoring the QC table gives ACH-000393)
+pmca6-chain-0006-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000393  0.8528    0.8528  
+    ACH-000018  0.8528    0.8528  
+    ACH-000544  0.8528    0.8528  
+    ACH-000740  0.8528    0.8528  
+    ACH-000670  0.8528    0.8528  
+    ACH-000716  0.8528    0.8528  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000393  core      
+    ACH-000018  core      
+    ACH-000544  core      
+    ACH-000740  core      
+    ACH-000670  core      
+    ACH-000716  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000393,(depends on: round 1 answer ACH-000018; highest core-panel auc is 0.8528 on ACH-000393 -> ACH-000393)
+pmca6-chain-0006-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000393: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000393"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9995    1.3993   
+    RPUSD3   0.0004    0.0005   
+    SPATA32  0.0001    0.0002   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000393; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca6-chain-0006-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000393 and Drug_1507: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000393' and compound='Drug_1507'"")
+    model prediction against the observed value.
+    cell_line   compound   auc_pred  auc_true
+    ----------  ---------  --------  --------
+    ACH-000393  Drug_1507  0.8528    0.8997  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.05; AGREES,"(depends on: round 3; |0.8528 - 0.8997| = 0.0469, tolerance 0.10 -> 0.05; AGREES; no complications at this tier)"
+pmca7-chain-0007-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 107 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_1520
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_1520'"")
+    predicted AUC for Drug_1520, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000523  0.8255  
+    ACH-000356  0.8255  
+    ACH-000346  0.8255  
+    ACH-000427  0.8255  
+    ACH-000535  0.8256  
+    ACH-000274  0.8256  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_1520' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000274  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000523,(depends on: -; lowest usable auc is 0.8255 on ACH-000523 -> ACH-000523)
+pmca7-chain-0007-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000523  0.8255    0.8255  
+    ACH-000356  0.8255    0.8255  
+    ACH-000346  0.8255    0.8255  
+    ACH-000427  0.8255    0.8255  
+    ACH-000535  0.8256    0.8256  
+    ACH-000274  0.8256    0.8256  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000523  core         
+    ACH-000356  core         
+    ACH-000346  core         
+    ACH-000427  core         
+    ACH-000535  observational
+    ACH-000274  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000274,"(depends on: round 1 answer ACH-000523; highest core-panel auc is 0.8256 on ACH-000274 -> ACH-000274; ablations: ranking without the panel table gives ACH-000535, which is observational)"
+pmca7-chain-0007-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000274: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000274"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9992    1.3989   
+    RPUSD3   0.0004    0.0005   
+    SPATA32  0.0004    0.0005   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    GGH      0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000274; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca7-chain-0007-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000274 and Drug_1520: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000274' and compound='Drug_1520'"")
+    model prediction against the observed value.
+    cell_line   compound   auc_pred  auc_true
+    ----------  ---------  --------  --------
+    ACH-000274  Drug_1520  0.8256    0.6527  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.17; DISAGREES,"(depends on: round 3; |0.8256 - 0.6527| = 0.1729, tolerance 0.10 -> 0.17; DISAGREES; no complications at this tier)"
+pmca8-chain-0008-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 108 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_195
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_195'"")
+    predicted AUC for Drug_195, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000163  0.5749  
+    ACH-000828  0.5749  
+    ACH-000396  0.5749  
+    ACH-000661  0.5749  
+    ACH-000889  0.5749  
+    ACH-001129  0.5749  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_195' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-001129  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000163,(depends on: -; lowest usable auc is 0.5749 on ACH-000163 -> ACH-000163)
+pmca8-chain-0008-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000163  0.5749    0.5749  
+    ACH-000828  0.5749    0.5749  
+    ACH-000396  0.5749    0.5749  
+    ACH-000661  0.5749    0.5749  
+    ACH-000889  0.5749    0.5749  
+    ACH-001129  0.5749    0.5749  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000163  core      
+    ACH-000828  core      
+    ACH-000396  core      
+    ACH-000661  core      
+    ACH-000889  core      
+    ACH-001129  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000163,(depends on: round 1 answer ACH-000163; highest core-panel auc is 0.5749 on ACH-000163 -> ACH-000163)
+pmca8-chain-0008-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000163: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000163"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9991    1.3987   
+    RPUSD3   0.0006    0.0009   
+    SPATA32  0.0003    0.0004   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000163; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca8-chain-0008-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000163 and Drug_195: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000163' and compound='Drug_195'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000163  Drug_195  0.5749    0.5881  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.01; AGREES,"(depends on: round 3; |0.5749 - 0.5881| = 0.0132, tolerance 0.10 -> 0.01; AGREES; no complications at this tier)"
+pmca9-chain-0009-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 109 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_413
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_413'"")
+    predicted AUC for Drug_413, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000835  0.7235  
+    ACH-000995  0.7226  
+    ACH-000643  0.7243  
+    ACH-000738  0.7237  
+    ACH-000061  0.7242  
+    ACH-000696  0.7243  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_413' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000696  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000995,(depends on: -; lowest usable auc is 0.7226 on ACH-000995 -> ACH-000995)
+pmca9-chain-0009-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000835  0.7235    0.7235  
+    ACH-000995  0.7226    0.7226  
+    ACH-000643  0.7243    0.7243  
+    ACH-000738  0.7237    0.7237  
+    ACH-000061  0.7242    0.7242  
+    ACH-000696  0.7243    0.7243  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000835  core      
+    ACH-000995  core      
+    ACH-000643  core      
+    ACH-000738  core      
+    ACH-000061  core      
+    ACH-000696  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000643,(depends on: round 1 answer ACH-000995; highest core-panel auc is 0.7243 on ACH-000643 -> ACH-000643)
+pmca9-chain-0009-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000643: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000643"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9952    1.3933   
+    RPUSD3   0.0040    0.0057   
+    SPATA32  0.0007    0.0009   
+    BCR      0.0000    0.0001   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000643; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca9-chain-0009-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000643 and Drug_413: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000643' and compound='Drug_413'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000643  Drug_413  0.7243    0.7218  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.00; AGREES,"(depends on: round 3; |0.7243 - 0.7218| = 0.0025, tolerance 0.10 -> 0.00; AGREES; no complications at this tier)"
+pmca10-chain-0010-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 110 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_435
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_435'"")
+    predicted AUC for Drug_435, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000670  0.8027  
+    ACH-000131  0.8027  
+    ACH-000640  0.8027  
+    ACH-000580  0.8028  
+    ACH-000759  0.8028  
+    ACH-000564  0.8026  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_435' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000564  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000670,(depends on: -; lowest usable auc is 0.8027 on ACH-000670 -> ACH-000670; ablations: ignoring the QC table gives ACH-000564)
+pmca10-chain-0010-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000670  0.8027    0.8027  
+    ACH-000131  0.8027    0.8027  
+    ACH-000640  0.8027    0.8027  
+    ACH-000580  0.8028    0.8028  
+    ACH-000759  0.8028    0.8028  
+    ACH-000564  0.8026    0.8026  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000670  core      
+    ACH-000131  core      
+    ACH-000640  core      
+    ACH-000580  core      
+    ACH-000759  core      
+    ACH-000564  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000580,(depends on: round 1 answer ACH-000670; highest core-panel auc is 0.8028 on ACH-000580 -> ACH-000580)
+pmca10-chain-0010-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000580: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000580"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9974    1.3963   
+    RPUSD3   0.0019    0.0026   
+    SPATA32  0.0007    0.0010   
+    EIF2S1   0.0000    0.0000   
+    BCR      0.0000    0.0000   
+    GGH      0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000580; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca10-chain-0010-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000580 and Drug_435: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000580' and compound='Drug_435'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000580  Drug_435  0.8028    0.9912  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.19; DISAGREES,"(depends on: round 3; |0.8028 - 0.9912| = 0.1884, tolerance 0.10 -> 0.19; DISAGREES; no complications at this tier)"
+pmca11-chain-0011-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 111 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_490
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_490'"")
+    predicted AUC for Drug_490, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000974  0.3366  
+    ACH-000013  0.3352  
+    ACH-000077  0.3380  
+    ACH-000941  0.3374  
+    ACH-000984  0.3370  
+    ACH-000775  0.3376  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_490' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000775  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000013,(depends on: -; lowest usable auc is 0.3352 on ACH-000013 -> ACH-000013)
+pmca11-chain-0011-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000974  0.3366    0.3366  
+    ACH-000013  0.3352    0.3352  
+    ACH-000077  0.3380    0.3380  
+    ACH-000941  0.3374    0.3374  
+    ACH-000984  0.3370    0.3370  
+    ACH-000775  0.3376    0.3376  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000974  core      
+    ACH-000013  core      
+    ACH-000077  core      
+    ACH-000941  core      
+    ACH-000984  core      
+    ACH-000775  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000077,(depends on: round 1 answer ACH-000013; highest core-panel auc is 0.3380 on ACH-000077 -> ACH-000077)
+pmca11-chain-0011-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000077: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000077"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9989    1.3984   
+    SPATA32  0.0007    0.0009   
+    RPUSD3   0.0004    0.0006   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    CEP350   0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,SPATA32,"(depends on: round 2 answer ACH-000077; highest non-sink attn_sum is SPATA32 -> SPATA32; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca11-chain-0011-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000077 and Drug_490: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000077' and compound='Drug_490'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000077  Drug_490  0.3380    0.3968  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.06; AGREES,"(depends on: round 3; |0.3380 - 0.3968| = 0.0588, tolerance 0.10 -> 0.06; AGREES; no complications at this tier)"
+pmca12-chain-0012-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 112 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_558
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_558'"")
+    predicted AUC for Drug_558, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000220  0.8170  
+    ACH-000781  0.8169  
+    ACH-000654  0.8170  
+    ACH-000759  0.8168  
+    ACH-000376  0.8168  
+    ACH-000784  0.8167  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_558' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000784  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000759,(depends on: -; lowest usable auc is 0.8168 on ACH-000759 -> ACH-000759; ablations: ignoring the QC table gives ACH-000784)
+pmca12-chain-0012-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000220  0.8170    0.8170  
+    ACH-000781  0.8169    0.8169  
+    ACH-000654  0.8170    0.8170  
+    ACH-000759  0.8168    0.8168  
+    ACH-000376  0.8168    0.8168  
+    ACH-000784  0.8167    0.8167  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000220  observational
+    ACH-000781  core         
+    ACH-000654  core         
+    ACH-000759  core         
+    ACH-000376  core         
+    ACH-000784  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000654,"(depends on: round 1 answer ACH-000759; highest core-panel auc is 0.8170 on ACH-000654 -> ACH-000654; ablations: ranking without the panel table gives ACH-000220, which is observational)"
+pmca12-chain-0012-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000654: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000654"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9968    1.3956   
+    SPATA32  0.0024    0.0034   
+    RPUSD3   0.0007    0.0010   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,SPATA32,"(depends on: round 2 answer ACH-000654; highest non-sink attn_sum is SPATA32 -> SPATA32; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca12-chain-0012-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000654 and Drug_558: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000654' and compound='Drug_558'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000654  Drug_558  0.8170    1.0000  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.18; DISAGREES,"(depends on: round 3; |0.8170 - 1.0000| = 0.1830, tolerance 0.10 -> 0.18; DISAGREES; no complications at this tier)"
+pmca13-chain-0013-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 113 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_564
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_564'"")
+    predicted AUC for Drug_564, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000541  0.7559  
+    ACH-000380  0.7569  
+    ACH-000430  0.7548  
+    ACH-000860  0.7556  
+    ACH-000943  0.7548  
+    ACH-000393  0.7559  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_564' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000430  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000943,(depends on: -; lowest usable auc is 0.7548 on ACH-000943 -> ACH-000943; ablations: ignoring the QC table gives ACH-000430)
+pmca13-chain-0013-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000541  0.7559    0.7559  
+    ACH-000380  0.7569    0.7569  
+    ACH-000430  0.7548    0.7548  
+    ACH-000860  0.7556    0.7556  
+    ACH-000943  0.7548    0.7548  
+    ACH-000393  0.7559    0.7559  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000541  core      
+    ACH-000380  core      
+    ACH-000430  core      
+    ACH-000860  core      
+    ACH-000943  core      
+    ACH-000393  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000380,(depends on: round 1 answer ACH-000943; highest core-panel auc is 0.7569 on ACH-000380 -> ACH-000380)
+pmca13-chain-0013-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000380: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000380"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9958    1.3942   
+    SPATA32  0.0023    0.0032   
+    RPUSD3   0.0019    0.0026   
+    EIF2S1   0.0000    0.0000   
+    BCR      0.0000    0.0000   
+    CEP350   0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,SPATA32,"(depends on: round 2 answer ACH-000380; highest non-sink attn_sum is SPATA32 -> SPATA32; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca13-chain-0013-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000380 and Drug_564: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000380' and compound='Drug_564'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000380  Drug_564  0.7569    0.8343  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.08; AGREES,"(depends on: round 3; |0.7569 - 0.8343| = 0.0774, tolerance 0.10 -> 0.08; AGREES; no complications at this tier)"
+pmca14-chain-0014-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 114 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_614
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_614'"")
+    predicted AUC for Drug_614, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000171  0.4554  
+    ACH-000062  0.4553  
+    ACH-000102  0.4544  
+    ACH-000311  0.4557  
+    ACH-000481  0.4555  
+    ACH-000759  0.4556  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_614' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000759  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000102,(depends on: -; lowest usable auc is 0.4544 on ACH-000102 -> ACH-000102)
+pmca14-chain-0014-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000171  0.4554    0.4554  
+    ACH-000062  0.4553    0.4553  
+    ACH-000102  0.4544    0.4544  
+    ACH-000311  0.4557    0.4557  
+    ACH-000481  0.4555    0.4555  
+    ACH-000759  0.4556    0.4556  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000171  core      
+    ACH-000062  core      
+    ACH-000102  core      
+    ACH-000311  core      
+    ACH-000481  core      
+    ACH-000759  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000311,(depends on: round 1 answer ACH-000102; highest core-panel auc is 0.4557 on ACH-000311 -> ACH-000311)
+pmca14-chain-0014-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000311: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000311"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9990    1.3986   
+    RPUSD3   0.0007    0.0010   
+    SPATA32  0.0003    0.0004   
+    EIF2S1   0.0000    0.0000   
+    BCR      0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000311; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca14-chain-0014-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000311 and Drug_614: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000311' and compound='Drug_614'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000311  Drug_614  0.4557    0.3844  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.07; AGREES,"(depends on: round 3; |0.4557 - 0.3844| = 0.0713, tolerance 0.10 -> 0.07; AGREES; no complications at this tier)"
+pmca15-chain-0015-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 115 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_643
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_643'"")
+    predicted AUC for Drug_643, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000202  0.7826  
+    ACH-000496  0.7829  
+    ACH-000842  0.7819  
+    ACH-000131  0.7828  
+    ACH-000678  0.7830  
+    ACH-000481  0.7827  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_643' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000842  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000202,(depends on: -; lowest usable auc is 0.7826 on ACH-000202 -> ACH-000202; ablations: ignoring the QC table gives ACH-000842)
+pmca15-chain-0015-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000202  0.7826    0.7826  
+    ACH-000496  0.7829    0.7829  
+    ACH-000842  0.7819    0.7819  
+    ACH-000131  0.7828    0.7828  
+    ACH-000678  0.7830    0.7830  
+    ACH-000481  0.7827    0.7827  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000202  core      
+    ACH-000496  core      
+    ACH-000842  core      
+    ACH-000131  core      
+    ACH-000678  core      
+    ACH-000481  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000678,(depends on: round 1 answer ACH-000202; highest core-panel auc is 0.7830 on ACH-000678 -> ACH-000678)
+pmca15-chain-0015-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000678: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000678"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9973    1.3962   
+    RPUSD3   0.0024    0.0034   
+    SPATA32  0.0003    0.0004   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000678; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca15-chain-0015-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000678 and Drug_643: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000678' and compound='Drug_643'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000678  Drug_643  0.7830    0.9141  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.13; DISAGREES,"(depends on: round 3; |0.7830 - 0.9141| = 0.1311, tolerance 0.10 -> 0.13; DISAGREES; no complications at this tier)"
+pmca16-chain-0016-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 116 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_665
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_665'"")
+    predicted AUC for Drug_665, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000381  0.8244  
+    ACH-000954  0.8245  
+    ACH-000468  0.8244  
+    ACH-000764  0.8248  
+    ACH-000389  0.8244  
+    ACH-000665  0.8247  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_665' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000381  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000468,(depends on: -; lowest usable auc is 0.8244 on ACH-000468 -> ACH-000468; ablations: ignoring the QC table gives ACH-000381)
+pmca16-chain-0016-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000381  0.8244    0.8244  
+    ACH-000954  0.8245    0.8245  
+    ACH-000468  0.8244    0.8244  
+    ACH-000764  0.8248    0.8248  
+    ACH-000389  0.8244    0.8244  
+    ACH-000665  0.8247    0.8247  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000381  core      
+    ACH-000954  core      
+    ACH-000468  core      
+    ACH-000764  core      
+    ACH-000389  core      
+    ACH-000665  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000764,(depends on: round 1 answer ACH-000468; highest core-panel auc is 0.8248 on ACH-000764 -> ACH-000764)
+pmca16-chain-0016-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000764: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000764"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9990    1.3987   
+    RPUSD3   0.0008    0.0011   
+    SPATA32  0.0002    0.0002   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    GGH      0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000764; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca16-chain-0016-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000764 and Drug_665: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000764' and compound='Drug_665'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000764  Drug_665  0.8248    0.8422  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.02; AGREES,"(depends on: round 3; |0.8248 - 0.8422| = 0.0174, tolerance 0.10 -> 0.02; AGREES; no complications at this tier)"
+pmca17-chain-0017-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 117 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_685
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_685'"")
+    predicted AUC for Drug_685, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000656  0.7833  
+    ACH-000616  0.7820  
+    ACH-000978  0.7819  
+    ACH-000550  0.7808  
+    ACH-000801  0.7811  
+    ACH-000730  0.7805  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_685' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000730  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000550,(depends on: -; lowest usable auc is 0.7808 on ACH-000550 -> ACH-000550; ablations: ignoring the QC table gives ACH-000730)
+pmca17-chain-0017-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000656  0.7833    0.7833  
+    ACH-000616  0.7820    0.7820  
+    ACH-000978  0.7819    0.7819  
+    ACH-000550  0.7808    0.7808  
+    ACH-000801  0.7811    0.7811  
+    ACH-000730  0.7805    0.7805  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000656  observational
+    ACH-000616  core         
+    ACH-000978  core         
+    ACH-000550  core         
+    ACH-000801  core         
+    ACH-000730  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000616,"(depends on: round 1 answer ACH-000550; highest core-panel auc is 0.7820 on ACH-000616 -> ACH-000616; ablations: ranking without the panel table gives ACH-000656, which is observational)"
+pmca17-chain-0017-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000616: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000616"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9997    1.3996   
+    RPUSD3   0.0002    0.0002   
+    SPATA32  0.0001    0.0001   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000616; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca17-chain-0017-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000616 and Drug_685: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000616' and compound='Drug_685'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000616  Drug_685  0.7820    0.7717  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.01; AGREES,"(depends on: round 3; |0.7820 - 0.7717| = 0.0103, tolerance 0.10 -> 0.01; AGREES; no complications at this tier)"
+pmca18-chain-0018-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 118 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_749
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_749'"")
+    predicted AUC for Drug_749, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000090  0.7251  
+    ACH-000501  0.7261  
+    ACH-000587  0.7257  
+    ACH-000231  0.7267  
+    ACH-000781  0.7255  
+    ACH-000075  0.7243  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_749' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000075  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000090,(depends on: -; lowest usable auc is 0.7251 on ACH-000090 -> ACH-000090; ablations: ignoring the QC table gives ACH-000075)
+pmca18-chain-0018-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000090  0.7251    0.7251  
+    ACH-000501  0.7261    0.7261  
+    ACH-000587  0.7257    0.7257  
+    ACH-000231  0.7267    0.7267  
+    ACH-000781  0.7255    0.7255  
+    ACH-000075  0.7243    0.7243  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000090  core         
+    ACH-000501  core         
+    ACH-000587  core         
+    ACH-000231  observational
+    ACH-000781  core         
+    ACH-000075  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000501,"(depends on: round 1 answer ACH-000090; highest core-panel auc is 0.7261 on ACH-000501 -> ACH-000501; ablations: ranking without the panel table gives ACH-000231, which is observational)"
+pmca18-chain-0018-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000501: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000501"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9981    1.3973   
+    RPUSD3   0.0016    0.0022   
+    SPATA32  0.0003    0.0004   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    GGH      0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000501; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca18-chain-0018-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000501 and Drug_749: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000501' and compound='Drug_749'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000501  Drug_749  0.7261    0.8115  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.09; AGREES,"(depends on: round 3; |0.7261 - 0.8115| = 0.0854, tolerance 0.10 -> 0.09; AGREES; no complications at this tier)"
+pmca19-chain-0019-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 119 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_768
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_768'"")
+    predicted AUC for Drug_768, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000837  0.7937  
+    ACH-000685  0.7939  
+    ACH-000936  0.7939  
+    ACH-000393  0.7940  
+    ACH-000828  0.7944  
+    ACH-000580  0.7938  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_768' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000580  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000837,(depends on: -; lowest usable auc is 0.7937 on ACH-000837 -> ACH-000837)
+pmca19-chain-0019-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000837  0.7937    0.7937  
+    ACH-000685  0.7939    0.7939  
+    ACH-000936  0.7939    0.7939  
+    ACH-000393  0.7940    0.7940  
+    ACH-000828  0.7944    0.7944  
+    ACH-000580  0.7938    0.7938  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000837  core      
+    ACH-000685  core      
+    ACH-000936  core      
+    ACH-000393  core      
+    ACH-000828  core      
+    ACH-000580  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000828,(depends on: round 1 answer ACH-000837; highest core-panel auc is 0.7944 on ACH-000828 -> ACH-000828)
+pmca19-chain-0019-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000828: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000828"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9996    1.3994   
+    RPUSD3   0.0003    0.0004   
+    SPATA32  0.0002    0.0002   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    CEP350   0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000828; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca19-chain-0019-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000828 and Drug_768: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000828' and compound='Drug_768'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000828  Drug_768  0.7944    0.9529  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.16; DISAGREES,"(depends on: round 3; |0.7944 - 0.9529| = 0.1585, tolerance 0.10 -> 0.16; DISAGREES; no complications at this tier)"
+pmca20-chain-0020-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 120 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_802
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_802'"")
+    predicted AUC for Drug_802, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000877  0.7340  
+    ACH-000553  0.7343  
+    ACH-000204  0.7339  
+    ACH-001306  0.7343  
+    ACH-000386  0.7339  
+    ACH-000400  0.7343  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_802' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000204  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000386,(depends on: -; lowest usable auc is 0.7339 on ACH-000386 -> ACH-000386; ablations: ignoring the QC table gives ACH-000204)
+pmca20-chain-0020-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000877  0.7340    0.7340  
+    ACH-000553  0.7343    0.7343  
+    ACH-000204  0.7339    0.7339  
+    ACH-001306  0.7343    0.7343  
+    ACH-000386  0.7339    0.7339  
+    ACH-000400  0.7343    0.7343  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000877  core         
+    ACH-000553  observational
+    ACH-000204  core         
+    ACH-001306  core         
+    ACH-000386  core         
+    ACH-000400  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-001306,"(depends on: round 1 answer ACH-000386; highest core-panel auc is 0.7343 on ACH-001306 -> ACH-001306; ablations: ranking without the panel table gives ACH-000553, which is observational)"
+pmca20-chain-0020-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-001306: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-001306"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9991    1.3988   
+    RPUSD3   0.0006    0.0008   
+    SPATA32  0.0002    0.0003   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-001306; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca20-chain-0020-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-001306 and Drug_802: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-001306' and compound='Drug_802'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-001306  Drug_802  0.7343    0.8892  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.15; DISAGREES,"(depends on: round 3; |0.7343 - 0.8892| = 0.1549, tolerance 0.10 -> 0.15; DISAGREES; no complications at this tier)"
+pmca21-chain-0021-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 121 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_870
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_870'"")
+    predicted AUC for Drug_870, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000418  0.6922  
+    ACH-000972  0.6932  
+    ACH-000739  0.6926  
+    ACH-000133  0.6920  
+    ACH-000109  0.6922  
+    ACH-000487  0.6925  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_870' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000487  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000133,(depends on: -; lowest usable auc is 0.6920 on ACH-000133 -> ACH-000133)
+pmca21-chain-0021-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000418  0.6922    0.6922  
+    ACH-000972  0.6932    0.6932  
+    ACH-000739  0.6926    0.6926  
+    ACH-000133  0.6920    0.6920  
+    ACH-000109  0.6922    0.6922  
+    ACH-000487  0.6925    0.6925  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000418  core         
+    ACH-000972  observational
+    ACH-000739  core         
+    ACH-000133  core         
+    ACH-000109  core         
+    ACH-000487  core         
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000739,"(depends on: round 1 answer ACH-000133; highest core-panel auc is 0.6926 on ACH-000739 -> ACH-000739; ablations: ranking without the panel table gives ACH-000972, which is observational)"
+pmca21-chain-0021-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000739: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000739"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9925    1.3895   
+    RPUSD3   0.0051    0.0072   
+    SPATA32  0.0023    0.0032   
+    BCR      0.0000    0.0001   
+    EIF2S1   0.0000    0.0001   
+    GGH      0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000739; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca21-chain-0021-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000739 and Drug_870: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000739' and compound='Drug_870'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000739  Drug_870  0.6926    0.7250  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.03; AGREES,"(depends on: round 3; |0.6926 - 0.7250| = 0.0324, tolerance 0.10 -> 0.03; AGREES; no complications at this tier)"
+pmca22-chain-0022-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 122 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_883
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_883'"")
+    predicted AUC for Drug_883, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000827  0.8068  
+    ACH-000075  0.8062  
+    ACH-000408  0.8071  
+    ACH-000893  0.8080  
+    ACH-000967  0.8087  
+    ACH-000740  0.8071  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_883' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000075  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000827,(depends on: -; lowest usable auc is 0.8068 on ACH-000827 -> ACH-000827; ablations: ignoring the QC table gives ACH-000075)
+pmca22-chain-0022-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000827  0.8068    0.8068  
+    ACH-000075  0.8062    0.8062  
+    ACH-000408  0.8071    0.8071  
+    ACH-000893  0.8080    0.8080  
+    ACH-000967  0.8087    0.8087  
+    ACH-000740  0.8071    0.8071  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role
+    ----------  ----------
+    ACH-000827  core      
+    ACH-000075  core      
+    ACH-000408  core      
+    ACH-000893  core      
+    ACH-000967  core      
+    ACH-000740  core      
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000967,(depends on: round 1 answer ACH-000827; highest core-panel auc is 0.8087 on ACH-000967 -> ACH-000967)
+pmca22-chain-0022-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000967: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000967"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9995    1.3993   
+    RPUSD3   0.0004    0.0005   
+    SPATA32  0.0001    0.0002   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    COG5     0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000967; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca22-chain-0022-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000967 and Drug_883: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000967' and compound='Drug_883'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000967  Drug_883  0.8087    0.9057  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.10; AGREES,"(depends on: round 3; |0.8087 - 0.9057| = 0.0970, tolerance 0.10 -> 0.10; AGREES; no complications at this tier)"
+pmca23-chain-0023-hard,1,sensitivity_ranking,"SESSION
+You are analysing screen 123 at the Ridgefield oncology screening facility:
+24 compounds profiled against 371 patient-derived cancer cell lines,
+with response predicted by Paccmann MCA from gene expression and compound structure.
+
+This is a 4-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the prediction store
+  schema_lookup(metric=)                          which metric is primary, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: compound panel, cell-line
+                                                  roles, replication plan
+  attention_lookup(sample=, axis=, k=)            model attention over genes or
+                                                  compound tokens, from provenance
+
+TERMS
+  auc              predicted dose-response AUC; lower means more sensitive
+  cell_line        the DepMap accession of a patient-derived line
+  compound         the screened compound label
+  panel_role       core lines are rankable; observational ones are carried for reference
+  attention        the model's own weight on a gene, captured at inference
+
+ROUND 1 - TASK (sensitivity_ranking)
+Which cell line is predicted most sensitive to Drug_895
+(lowest auc)?
+
+RULES
+1. A cell line whose row is flagged in the quality gate cannot be
+   the answer, however extreme its value.
+2. Lower auc means more sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""], where=""compound='Drug_895'"")
+    predicted AUC for Drug_895, one row per cell line.
+    cell_line   auc_pred
+    ----------  --------
+    ACH-000481  0.5215  
+    ACH-000090  0.5216  
+    ACH-000801  0.5214  
+    ACH-000434  0.5218  
+    ACH-000473  0.5213  
+    ACH-000435  0.5219  
+
+>>> qc_lookup(table=""predictions"", select=[""cell_line"", ""flag""], where=""compound='Drug_895' and flag is not null"")
+    cells voided by QC; a voided cell cannot be an answer.
+    cell_line   flag        
+    ----------  ------------
+    ACH-000473  failed_assay
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000801,(depends on: -; lowest usable auc is 0.5214 on ACH-000801 -> ACH-000801; ablations: ignoring the QC table gives ACH-000473)
+pmca23-chain-0023-hard,2,panel_restricted_rank,"ROUND 2 - TASK (panel_restricted_rank)
+Among the core panel only, which cell line is predicted
+least sensitive (highest auc)?
+
+RULES
+1. Only cell lines whose panel_role is core can be ranked;
+   observational ones are carried for reference.
+2. Higher auc means less sensitive.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""cell_line"", ""auc_pred""])
+    predicted vs observed AUC, one row per cell line.
+    cell_line   auc_pred  auc_true
+    ----------  --------  --------
+    ACH-000481  0.5215    0.5215  
+    ACH-000090  0.5216    0.5216  
+    ACH-000801  0.5214    0.5214  
+    ACH-000434  0.5218    0.5218  
+    ACH-000473  0.5213    0.5213  
+    ACH-000435  0.5219    0.5219  
+
+>>> design_lookup(aspect=""cell_line_panel"")
+    panel membership for this screen.
+    cell_line   panel_role   
+    ----------  -------------
+    ACH-000481  core         
+    ACH-000090  core         
+    ACH-000801  core         
+    ACH-000434  core         
+    ACH-000473  core         
+    ACH-000435  observational
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <cell_line label exactly as it appears in the table>
+",,ACH-000434,"(depends on: round 1 answer ACH-000801; highest core-panel auc is 0.5218 on ACH-000434 -> ACH-000434; ablations: ranking without the panel table gives ACH-000435, which is observational)"
+pmca23-chain-0023-hard,3,attention_attribution,"ROUND 3 - TASK (attention_attribution)
+For cell line ACH-000434: which gene did the model attend to most
+when making this prediction?
+
+RULES
+1. A gene marked housekeeping_sink absorbs attention on every
+   sample and carries no sample-specific signal; it cannot be
+   the answer.
+2. Rank on attn_sum, the distribution-shaped reduction.
+
+TOOL OUTPUTS
+
+>>> attention_lookup(sample=""ACH-000434"", axis=""gene"", k=6)
+    model attention over genes for this sample, from captured provenance.
+    gene     attn_sum  attn_peak
+    -------  --------  ---------
+    PARN     0.9974    1.3964   
+    RPUSD3   0.0023    0.0032   
+    SPATA32  0.0003    0.0004   
+    BCR      0.0000    0.0000   
+    EIF2S1   0.0000    0.0000   
+    CEP350   0.0000    0.0000   
+
+>>> schema_lookup(metric=""attention"")
+    genes excluded from attribution claims.
+    gene  role             
+    ----  -----------------
+    PARN  housekeeping_sink
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <gene symbol exactly as it appears in the table>
+",,RPUSD3,"(depends on: round 2 answer ACH-000434; highest non-sink attn_sum is RPUSD3 -> RPUSD3; ablations: taking the top row without the schema table gives PARN, the housekeeping sink)"
+pmca23-chain-0023-hard,4,prediction_audit,"ROUND 4 - TASK (prediction_audit)
+For ACH-000434 and Drug_895: report the absolute error between
+predicted and observed auc, and whether the model agrees.
+
+RULES
+1. AGREES when the absolute error is within the tolerance in the
+   schema table, DISAGREES otherwise.
+2. Report the error to two decimal places.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table=""predictions"", select=[""auc_pred"", ""auc_true""], where=""cell_line='ACH-000434' and compound='Drug_895'"")
+    model prediction against the observed value.
+    cell_line   compound  auc_pred  auc_true
+    ----------  --------  --------  --------
+    ACH-000434  Drug_895  0.5218    0.5760  
+
+>>> schema_lookup(metric=""auc"")
+    agreement tolerance for this metric.
+    metric  tolerance
+    ------  ---------
+    auc     0.10     
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <absolute error, two decimals>; <AGREES or DISAGREES>
+",,0.05; AGREES,"(depends on: round 3; |0.5218 - 0.5760| = 0.0542, tolerance 0.10 -> 0.05; AGREES; no complications at this tier)"
