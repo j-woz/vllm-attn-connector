@@ -714,18 +714,6 @@ class _WorkerSide:
                     torch.maximum(st.colsum[gi, 1, :n_keys], row[1],
                                   out=st.colsum[gi, 1, :n_keys])
                     if st.lwins is not None:
-                        # Which (layer, head) owned the max at each prefill
-                        # position this step, bucketed as first decode token (0)
-                        # against all later ones (1). The split is there to test
-                        # whether a head subset chosen on step 0 still holds for
-                        # the rest of the generation.
-                        #
-                        # Reads st.owner, which the layer loop above maintains.
-                        # This used to read a separate st.winner buffer that was
-                        # allocated, reset and never written, so both counters
-                        # were silently always zero -- a full-length array of
-                        # zeros rather than an error, which reads as "every
-                        # layer ties" and ranks them by index.
                         w = st.owner[gi, :n_keys]
                         b = 0 if g_idx == 0 else 1
                         st.lwins[b, gi] += torch.bincount(
@@ -1100,12 +1088,6 @@ class AttnConnector(KVConnectorBase_V1, SupportsHMA):
             if isinstance(meta, AttnMetadata):
                 self._worker.score_step(meta)
         finally:
-            # The registry is not cleared here. Its buffers are the destination
-            # the probe's copy kernel writes into, and under CUDA graphs that
-            # kernel is all that runs -- dropping the buffers would leave every
-            # later step with nothing to read. Freshness comes from the copy
-            # having run, not from the entry being new; `begin_step` below marks
-            # whether Python ran so the connector can tell the two apart.
             REGISTRY.begin_step()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
