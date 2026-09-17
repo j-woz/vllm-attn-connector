@@ -57,7 +57,7 @@ from vllm.logger import init_logger
 
 from .kernels import decode_attention
 from .layout import LayerLayout, UnsupportedLayout, resolve_layer_layout
-from .probe import REGISTRY, current_graph_key, install
+from .probe import REGISTRY, install
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -156,23 +156,29 @@ def _configure_registry(vllm_config: "VllmConfig") -> None:
     writing there. The worker connector is built before
     ``compile_or_warm_up_model`` runs, which is early enough.
 
-    The height that matters is the largest decode batch vLLM will capture a
-    graph for, which is capped by ``max_num_seqs`` -- the bigger mixed-batch
-    capture sizes are prefill-shaped and the probe skips them. With cudagraphs
-    off there is nothing to size ahead of time and the probe just grows the
-    buffer as batches grow.
+    The height is the largest decode row count the probe can ever see, which is
+    the larger of two numbers, not the smaller. ``max_num_seqs`` bounds a decode
+    batch, since ``max_query_len == 1`` means one row per request, and it can
+    exceed ``max_cudagraph_capture_size``: vLLM warms up at ``max_num_seqs``
+    rows *after* capturing graphs, so sizing to the capture size alone makes the
+    buffer grow once capture is over and costs every captured graph its copy
+    (observed on opt-125m, job 3166664: 512 vs 1024, all 51 graphs invalidated).
+    ``max_cudagraph_capture_size`` is kept in the max anyway, for the case where
+    sequence-parallel padding pushes a captured size past ``max_num_seqs``.
     """
     try:
         cc = vllm_config.compilation_config
         if getattr(cc.cudagraph_mode, "value", 0) == 0:
             return
-        size = cc.max_cudagraph_capture_size
-        if not size:
+        size = int(cc.max_cudagraph_capture_size or 0)
+        seqs = int(vllm_config.scheduler_config.max_num_seqs or 0)
+        rows = max(size, seqs)
+        if not rows:
             return
-        rows = min(int(size), int(vllm_config.scheduler_config.max_num_seqs))
         REGISTRY.configure(rows)
         logger.info("attn_connector: query buffers sized for %d decode row(s) "
-                    "(cudagraph_mode=%s)", rows, cc.cudagraph_mode)
+                    "(max_num_seqs=%d, max_cudagraph_capture_size=%d, "
+                    "cudagraph_mode=%s)", rows, seqs, size, cc.cudagraph_mode)
     except Exception as exc:  # pragma: no cover - config shape is vLLM's
         logger.warning("attn_connector: could not size the query buffers "
                        "ahead of CUDA graph capture: %s", exc)
@@ -534,9 +540,9 @@ class _WorkerSide:
         self._enabled = False
         # Decode steps that arrived with no queries to score them with.
         self._no_query_steps = 0
-        # CUDA graph keys already reported, so the log says once per graph
-        # which one the scoring ran under and stops.
-        self._keys_logged: set = set()
+        # Decode widths already reported, so the log says once per width how
+        # the queries reached the connector and then stops.
+        self._widths_logged: set = set()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         for layer_names, spec in self._groups:
@@ -631,7 +637,7 @@ class _WorkerSide:
 
     # -- per-step ----------------------------------------------------------- #
 
-    def _warn_no_queries(self, missing: list[str], graph_key, n_reqs: int) -> None:
+    def _warn_no_queries(self, missing: list[str], n_reqs: int) -> None:
         """Say so when a decode step arrives with no queries to score it with.
 
         This used to be a silent `continue` per layer, and that is how issue #2
@@ -647,11 +653,14 @@ class _WorkerSide:
             return
         logger.warning(
             "attn_connector: %d decode step(s) unscored: no queries for %d "
-            "layer(s) (%s%s) on a %d-request step, cudagraph key %s. Nothing "
-            "wrote those layers this step, so the probe is not reaching the "
-            "forward -- the records for these requests will be empty.",
+            "layer(s) (%s%s) on a %d-request step. The probe neither ran this "
+            "step nor recorded a copy into a CUDA graph that covers %d row(s) "
+            "(it covers up to %d), so the records for these requests will be "
+            "empty. cudagraph_mode=FULL without PIECEWISE is the known "
+            "configuration that does this.",
             c, len(missing), ", ".join(missing[:3]),
-            ", ..." if len(missing) > 3 else "", n_reqs, graph_key)
+            ", ..." if len(missing) > 3 else "", n_reqs, n_reqs,
+            REGISTRY.graph_rows(missing[0]) if missing else 0)
 
     def score_step(self, meta: AttnMetadata) -> None:
         """Score the decode queries this step produced, on the side stream."""
@@ -697,25 +706,26 @@ class _WorkerSide:
         # still reading. The copy is `n_reqs x heads x head_size` per layer.
         queries: dict[str, torch.Tensor] = {}
         if decoding:
-            gkey = current_graph_key()
             n_rows, raw, missing = len(decoding), {}, []
             for group in self._scored:
                 for layout in group.layers:
-                    q = REGISTRY.get(layout.layer_name, gkey)
-                    if q is None or q.shape[0] < n_rows:
+                    q = REGISTRY.get(layout.layer_name, n_rows)
+                    if q is None:
                         missing.append(layout.layer_name)
                     else:
                         raw[layout.layer_name] = q
             if missing:
-                self._warn_no_queries(missing, gkey, n_rows)
+                self._warn_no_queries(missing, n_rows)
                 unscored, decoding = decoding, []
             else:
-                if gkey not in self._keys_logged and len(self._keys_logged) < 12:
-                    self._keys_logged.add(gkey)
+                if (n_rows not in self._widths_logged
+                        and len(self._widths_logged) < 12):
+                    self._widths_logged.add(n_rows)
+                    name = self._scored[0].layers[0].layer_name
                     logger.info(
-                        "attn_connector: scoring %d decode row(s) under "
-                        "cudagraph key %s", n_rows,
-                        gkey if gkey is not None else "none (eager forward)")
+                        "attn_connector: scoring a %d-row decode step; the "
+                        "probe's recorded copies cover up to %d row(s)",
+                        n_rows, REGISTRY.graph_rows(name))
                 with torch.cuda.stream(stream):
                     queries = {name: q[:n_rows].clone()
                                for name, q in raw.items()}

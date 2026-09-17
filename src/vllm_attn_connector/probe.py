@@ -37,13 +37,33 @@ queries with no Python involved. The buffer is never cleared -- clearing it
 would be exactly the bug -- so the connector instead asks whether the write it
 is about to read is fresh *for this step*:
 
-* a graph write is fresh whenever the step replays a graph whose recorded
-  kernels include that copy. ``(cudagraph_runtime_mode, batch_descriptor)``
-  from the forward context is what vLLM's own dispatcher keys graphs by, and
-  both the capturing forward and every replay carry it, so the probe records
-  the key at capture time and the connector matches it at read time.
-* an eager write is fresh only for the step it ran on, tracked by a step
+* a live write is fresh only for the step it ran on, tracked by a step
   generation the connector bumps once per step.
+* a recorded write is fresh whenever a decode graph ran, and on a pure decode
+  step one always does. ``_capture`` asks
+  ``torch.cuda.is_current_stream_capturing()``, so it knows directly whether
+  its copy is being recorded rather than executed, and remembers the largest
+  decode batch it was recorded for. A decode step of no more rows than that
+  replayed a graph that writes this buffer.
+
+Why not key the buffer by the graph vLLM is about to replay: the connector
+cannot see which one that is. ``wait_for_save`` runs from ``post_forward`` in
+``v1/worker/gpu/model_runner.py``, which is outside the ``set_forward_context``
+block, and on the FULL path ``pre_forward`` is outside it too, so
+``get_forward_context`` is either unset or carries ``cudagraph_runtime_mode =
+NONE`` with no batch descriptor. Observed in job 3166664: the probe recorded 51
+graph keys during capture and the connector read ``None`` on every decode step.
+Asking whether a capture happened, which the probe can answer for itself, does
+not depend on the runner's plumbing.
+
+The inference is sound for every cudagraph mode vLLM ships, because the
+dispatcher never sends a pure decode batch to a graph the probe skipped.
+``FULL_AND_PIECEWISE`` and ``FULL_DECODE_ONLY`` capture a separate uniform
+decode graph per size, which is what the probe records; ``PIECEWISE`` leaves
+attention outside the graph, so the probe runs live; a batch too large for any
+graph runs eager, so the probe runs live. Plain ``cudagraph_mode=FULL`` captures
+only mixed-shaped graphs, which the probe skips, so it records nothing and the
+connector refuses every step with a warning rather than reading a stale buffer.
 
 Sizing: one buffer per layer, ``max_rows x heads x head_size``, where
 ``max_rows`` covers the largest captured decode batch. Not one buffer per
@@ -81,49 +101,6 @@ except ImportError:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 
-def graph_key_of(ctx: Any) -> Any | None:
-    """The CUDA graph a forward context runs under, or None for no graph.
-
-    ``(cudagraph_runtime_mode, batch_descriptor)`` is the pair vLLM's
-    ``CudagraphDispatcher`` itself uses to pick a graph
-    (``v1/cudagraph_dispatcher.py``), and ``BatchDescriptor`` is a frozen
-    dataclass, so the pair is hashable and compares by value. Capture and
-    replay of the same graph therefore produce equal keys, which is the whole
-    point: the probe records the key while capturing and the connector
-    reconstructs it while reading.
-
-    ``NONE`` means no graph will be replayed, so the probe's Python body runs
-    this step and the write is a live one. Its descriptor carries the raw token
-    count and would otherwise mint a fresh key per batch size, so it collapses
-    to None.
-    """
-    if ctx is None:
-        return None
-    mode = getattr(ctx, "cudagraph_runtime_mode", None)
-    desc = getattr(ctx, "batch_descriptor", None)
-    if mode is None or desc is None:
-        return None
-    if getattr(mode, "value", mode) == 0:        # CUDAGraphMode.NONE
-        return None
-    return (mode, desc)
-
-
-def current_graph_key() -> Any | None:
-    """``graph_key_of`` for the forward in progress.
-
-    Both halves call this: the probe from inside ``impl.forward``, the
-    connector from ``wait_for_save``, which vLLM runs inside the same
-    ``set_forward_context`` block (``kv_connector_model_runner_mixin.py``:
-    "This context manager must be used within an active forward context").
-    """
-    try:
-        from vllm.forward_context import get_forward_context
-
-        return graph_key_of(get_forward_context())
-    except Exception:
-        return None
-
-
 def _capturing() -> bool:
     try:
         return bool(torch.cuda.is_current_stream_capturing())
@@ -144,12 +121,15 @@ class QueryRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._buf: dict[str, torch.Tensor] = {}
-        # Graph keys whose recorded kernels write this layer's buffer. A
-        # permanent property of the graph, so a set and not a last-value.
-        self._graph_keys: dict[str, set] = {}
-        # Step generation at which the probe last ran *live* for this layer.
-        self._eager_gen: dict[str, int] = {}
-        self._rows: dict[str, int] = {}
+        # Largest decode batch this layer's copy was *recorded* for, over every
+        # CUDA graph capture seen. A permanent property of the graphs, so a
+        # running max and not a last-value: replaying any of them rewrites the
+        # buffer.
+        self._graph_rows: dict[str, int] = {}
+        # Step generation at which the probe last ran live for this layer, and
+        # the rows that write covered.
+        self._live_gen: dict[str, int] = {}
+        self._live_rows: dict[str, int] = {}
         self._gen = 0
         self._max_rows = 0
         self.enabled = False
@@ -167,14 +147,19 @@ class QueryRegistry:
 
     # -- probe side --------------------------------------------------------- #
 
-    def put(self, layer_name: str, q: torch.Tensor, n: int,
-            graph_key: Any = None) -> None:
-        """Copy ``q[:n]`` into this layer's buffer and record how it got there."""
+    def put(self, layer_name: str, q: torch.Tensor, n: int) -> None:
+        """Copy ``q[:n]`` into this layer's buffer and record how it got there.
+
+        ``is_current_stream_capturing`` is the whole distinction: True and the
+        copy is being recorded into a graph that will re-run it on every replay,
+        False and it is running now, for this step only.
+        """
+        recorded = _capturing()
         with self._lock:
             buf = self._buf.get(layer_name)
             if (buf is None or buf.shape[0] < n or buf.shape[1:] != q.shape[1:]
                     or buf.dtype != q.dtype or buf.device != q.device):
-                if _capturing():
+                if recorded:
                     # Allocating here would take the buffer from the graph's
                     # private pool, and the graph would be the only thing
                     # keeping it addressable. Skip instead: the key is not
@@ -186,45 +171,50 @@ class QueryRegistry:
                         "capture queries. Call REGISTRY.configure() before "
                         "capture.", layer_name, n)
                     return
-                stale = self._graph_keys.pop(layer_name, None)
+                stale = self._graph_rows.pop(layer_name, 0)
                 if stale:
                     logger.warning(
                         "attn_connector: %s query buffer grew to %d rows after "
-                        "%d CUDA graph(s) were captured against the old one; "
-                        "those graphs can no longer capture queries.",
-                        layer_name, max(n, self._max_rows), len(stale))
+                        "CUDA graphs were captured against the old one (up to "
+                        "%d rows); those graphs can no longer capture queries.",
+                        layer_name, max(n, self._max_rows), stale)
                 buf = torch.empty((max(n, self._max_rows), *q.shape[1:]),
                                   dtype=q.dtype, device=q.device)
                 self._buf[layer_name] = buf
             # Under capture this becomes a recorded kernel; every replay of the
             # graph re-runs it, which is what keeps the buffer current.
             buf[:n].copy_(q[:n])
-            if graph_key is None:
-                self._eager_gen[layer_name] = self._gen
+            if recorded:
+                self._graph_rows[layer_name] = max(
+                    self._graph_rows.get(layer_name, 0), n)
             else:
-                self._graph_keys.setdefault(layer_name, set()).add(graph_key)
-            self._rows[layer_name] = n
+                self._live_gen[layer_name] = self._gen
+                self._live_rows[layer_name] = n
             self.layers_seen.add(layer_name)
 
     # -- connector side ----------------------------------------------------- #
 
-    def get(self, layer_name: str, graph_key: Any = None) -> torch.Tensor | None:
-        """This layer's queries, or None if nothing wrote them *this step*.
+    def get(self, layer_name: str, n_rows: int) -> torch.Tensor | None:
+        """This layer's queries for a decode step of ``n_rows`` requests, or
+        None if nothing wrote them this step.
 
         None is the signal that the step cannot be scored. Returning a stale
         buffer instead would produce records that look right and are not.
         """
-        if graph_key is None:
-            if self._eager_gen.get(layer_name, -1) != self._gen:
-                return None
-        elif graph_key not in self._graph_keys.get(layer_name, ()):
+        buf = self._buf.get(layer_name)
+        if buf is None or buf.shape[0] < n_rows:
             return None
-        return self._buf.get(layer_name)
+        if (self._live_gen.get(layer_name, -1) == self._gen
+                and self._live_rows.get(layer_name, 0) >= n_rows):
+            return buf
+        if n_rows <= self._graph_rows.get(layer_name, 0):
+            return buf
+        return None
 
-    def rows(self, layer_name: str) -> int:
-        """Rows the last write to this layer covered. Capture-time under a
-        graph, so a padded batch size, not this step's request count."""
-        return self._rows.get(layer_name, 0)
+    def graph_rows(self, layer_name: str) -> int:
+        """Largest decode batch a captured graph writes this layer for, or 0 if
+        no graph does. Diagnostics only."""
+        return self._graph_rows.get(layer_name, 0)
 
     def end_step(self) -> None:
         """Retire live writes. Buffers deliberately survive: under CUDA graphs
@@ -236,9 +226,9 @@ class QueryRegistry:
         """Forget everything, buffers included. Not part of the step loop."""
         with self._lock:
             self._buf.clear()
-            self._graph_keys.clear()
-            self._eager_gen.clear()
-            self._rows.clear()
+            self._graph_rows.clear()
+            self._live_gen.clear()
+            self._live_rows.clear()
 
 
 REGISTRY = QueryRegistry()
@@ -268,7 +258,7 @@ def _capture(layer: Any, query: torch.Tensor, attn_metadata: Any) -> None:
     name = getattr(layer, "layer_name", None)
     if name is None:
         return
-    REGISTRY.put(name, query, n, current_graph_key())
+    REGISTRY.put(name, query, n)
 
 
 def install(backend: str | None = None) -> bool:
