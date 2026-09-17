@@ -97,6 +97,15 @@ def validate(buffer: list[dict], *, num_requests: int, top_pct: float,
 
     t = tasks[0]
     meta = t["custom_metadata"]
+    # Which KV cache group these scores came from. On a hybrid model the
+    # full-attention group is not group 0, and the block table must follow it.
+    print(f"       kv cache groups: scored group_id={meta.get('kv_cache_group_id')} "
+          f"of num_groups={meta.get('num_groups')}, "
+          f"scored_groups={meta.get('scored_groups')}, "
+          f"attention={meta.get('scored_attention')}, "
+          f"layers={meta.get('num_layers')}/{meta.get('num_layers_total')}, "
+          f"query_heads={meta.get('num_query_heads')}, "
+          f"nonfinite_steps={meta.get('decode_steps_nonfinite')}")
     check(t["activity_id"] == "decode_attention",
           f"activity labels the connector (got {t['activity_id']!r})")
     check(meta["metric"] == "decode_attention", "metric label recorded")
