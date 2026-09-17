@@ -20,15 +20,15 @@ What gets captured
 ------------------
 ``MCA.forward`` builds ``smiles_alphas`` as one tensor per (layer, head) --
 with ``multiheads=[4,4,4,4]`` that is 16 vectors of length
-``smiles_padding_length`` (paccmann.py:244-253). It then averages them over the
-head axis into ``prediction_dict['smiles_attention']``
-(paccmann.py:273-279), **destroying the per-head structure** that the vLLM
+``smiles_padding_length`` (``paccmann.py:244-253``). It then averages them over
+the head axis into ``prediction_dict['smiles_attention']``
+(``paccmann.py:273-279``), **destroying the per-head structure** that the vLLM
 payload goes to some trouble to preserve.
 
 Hooking ``ContextAttentionLayer`` catches the 16 vectors *before* that average,
 so ``attn_peak`` and ``attn_argmax_head`` are real rather than reconstructed
 from a mean. The gene axis is single-headed (``gene_attention_layer``,
-paccmann.py:231) and is captured the same way.
+``paccmann.py:231``) and is captured the same way.
 
 Both are also thrown away by the caller: ``test_paccmann.py:161`` binds
 ``pred_dict`` and never reads it. This module is the difference between that
@@ -40,65 +40,67 @@ Usage
 
     from vllm_attn_connector.drp_paccmann import PaccmannCapture
 
-    with Flowcept("vllm", workflow_id=wf, workflow_name="paccmann") as fc:
-        cap = PaccmannCapture(model, workflow_id=wf)
-        cap.send_workflow(params)
-        for smiles, gep, y in loader:
-            y_hat, _ = model(torch.squeeze(smiles), gep)
-            cap.emit(sample_ids=[...])      # one call per batch
-        cap.remove()
-
-``remove()`` detaches the hooks. ``PaccmannCapture`` is also a context manager,
-which is the safer spelling when an exception can skip the teardown.
+    with Flowcept("vllm", workflow_id=wf, workflow_name="paccmann"):
+        with PaccmannCapture(model, workflow_id=wf) as cap:
+            cap.send_workflow(params)
+            for smiles, gep, y in loader:
+                y_hat, _ = model(torch.squeeze(smiles), gep)
+                cap.emit(sample_ids=[...])      # one call per batch
 """
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any
 
-from .drp_emit import ATTENTION_ACTIVITY, emit_batch
+from .drp_capture import AttentionAxis, AttentionCapture
 
-__all__ = ["PaccmannCapture"]
+__all__ = ["GENE_AXIS", "SMILES_AXIS", "PaccmannCapture"]
+
+SMILES_AXIS = "smiles"
+GENE_AXIS = "gene"
+
+#: Workflow keys worth recording: what a later reader needs to interpret a bare
+#: attention vector -- the vocabulary it was tokenised with, the widths, and
+#: which checkpoint produced it.
+_WORKFLOW_KEYS = (
+    "smiles_language_filepath",
+    "smiles_vocabulary_size",
+    "smiles_padding_length",
+    "number_of_genes",
+    "multiheads",
+    "modelpath",
+)
 
 
-# Paccmann's attention is additive (Bahdanau): the alphas come from
-# `alpha_projection(tanh(reference_attention + context_attention))`
-# (layers.py:232-234), not from a scaled dot product. Recorded so these numbers
-# are never silently compared against the vLLM connector's, which measure
-# `softmax(q.K^T/sqrt d)`.
-METRIC_REFERENCE = "paccmann_mca_context_attention_additive"
-
-
-class PaccmannCapture:
+class PaccmannCapture(AttentionCapture):
     """Collect ``ContextAttentionLayer`` outputs from an MCA model.
 
     Attaches one forward hook per attention layer. Each hook stores the alphas
-    for the most recent forward pass; ``emit`` drains them.
+    for the most recent forward pass; :meth:`emit` drains them.
+
+    Parameters
+    ----------
+    model:
+        A Paccmann MCA model, in ``eval()`` mode.
+    workflow_id:
+        Flowcept workflow to attach records to.
+    interceptor:
+        Defaults to Flowcept's ``VLLMInterceptor``. Injectable for tests.
     """
 
-    def __init__(
-        self,
-        model: Any,
-        workflow_id: str,
-        interceptor: Any = None,
-        activity: str = ATTENTION_ACTIVITY,
-    ) -> None:
-        self.model = model
-        self.workflow_id = workflow_id
-        self.activity = activity
+    MODEL_NAME = "Paccmann_MCA"
+    FRAMEWORK = "torch"
+    # Additive (Bahdanau): alphas come from
+    # `alpha_projection(tanh(reference_attention + context_attention))`
+    # (layers.py:232-234), not from a scaled dot product.
+    METRIC_REFERENCE = "paccmann_mca_context_attention_additive"
 
-        if interceptor is None:
-            from flowcept.flowceptor.adapters.vllm.vllm_interceptor import (
-                VLLMInterceptor,
-            )
-
-            interceptor = VLLMInterceptor.get_instance()
-        self.interceptor = interceptor
-
-        # Ordered: the SMILES heads are registered in the order MCA builds them,
-        # so index i is `multiheads[0] * layer + head` -- the same `ind` the
-        # model computes at paccmann.py:248. That makes `attn_argmax_head`
-        # directly interpretable as a (layer, head) pair.
+    def __init__(self, model: Any, workflow_id: str, **kwargs: Any) -> None:
+        super().__init__(model, workflow_id, **kwargs)
+        # Ordered: SMILES heads are registered in the order MCA builds them, so
+        # index i is `multiheads[0] * layer + head` -- the same `ind` the model
+        # computes at paccmann.py:248. That makes `attn_argmax_head` directly
+        # interpretable as a (layer, head) pair.
         self._smiles: list[Any] = []
         self._gene: list[Any] = []
         self._handles: list[Any] = []
@@ -106,22 +108,16 @@ class PaccmannCapture:
 
     def _attach(self) -> None:
         # Imported here, not at module scope: this package must stay importable
-        # without Paccmann on the path (the tests rely on that).
+        # without Paccmann on the path (the unit tests rely on that).
         from paccmann_predictor.utils.layers import ContextAttentionLayer
 
-        model = self.model
-        gene_layer = getattr(model, "gene_attention_layer", None)
-
-        for module in model.modules():
+        for module in self.model.modules():
             if isinstance(module, ContextAttentionLayer):
-                self._handles.append(
-                    module.register_forward_hook(self._smiles_hook)
-                )
+                self._handles.append(module.register_forward_hook(self._smiles_hook))
 
+        gene_layer = getattr(self.model, "gene_attention_layer", None)
         if gene_layer is not None:
-            self._handles.append(
-                gene_layer.register_forward_hook(self._gene_hook)
-            )
+            self._handles.append(gene_layer.register_forward_hook(self._gene_hook))
 
         if not self._handles:
             raise RuntimeError(
@@ -147,89 +143,61 @@ class PaccmannCapture:
         self._smiles.clear()
         self._gene.clear()
 
-    def emit(
-        self,
-        sample_ids: Sequence[str],
-        metadata: dict[str, Any] | None = None,
-    ) -> list[str]:
-        """Emit the most recent forward pass and clear the buffers.
+    def collect(self, n_samples: int | None = None, **_: Any) -> list[AttentionAxis]:
+        """Drain the hooks into axes. Always clears, including on failure.
 
-        ``sample_ids`` must have one entry per row of the batch. Returns the
-        task ids written.
+        A retained batch would otherwise be silently prepended to the next one,
+        which would misattribute every subsequent record.
         """
-        if not self._smiles and not self._gene:
-            raise RuntimeError(
-                "nothing captured; call emit() after a forward pass, and check "
-                "the model is in eval() mode"
-            )
-
-        n = len(sample_ids)
-        meta = {
-            "model": "Paccmann_MCA",
-            "metric": "attention_weights",
-            "metric_reference": METRIC_REFERENCE,
-            "framework": "torch",
-        }
-        if metadata:
-            meta.update(metadata)
-
-        axes: list[dict[str, Any]] = []
-
-        if self._smiles:
-            # Captured as [n_heads][bs, T]; regroup to [bs][n_heads][T] so each
-            # sample carries its own per-head stack.
-            per_sample = [[h[i] for h in self._smiles] for i in range(n)]
-            axes.append({"name": "smiles", "per_head": per_sample})
-
-        if self._gene:
-            # Single-headed, but wrapped in a one-element list so the gene axis
-            # goes through exactly the same reduction as the SMILES axis.
-            g = self._gene[0]
-            axes.append(
-                {"name": "gene", "per_head": [[g[i]] for i in range(n)]}
-            )
-
         try:
-            return emit_batch(
-                self.interceptor,
-                workflow_id=self.workflow_id,
-                sample_ids=sample_ids,
-                axes=axes,
-                metadata=meta,
-                activity=self.activity,
-            )
+            if not self._smiles and not self._gene:
+                return []
+
+            n = n_samples if n_samples is not None else self._infer_batch_size()
+            axes: list[AttentionAxis] = []
+
+            if self._smiles:
+                # Captured as [n_heads][bs, T]; regroup to [bs][n_heads][T] so
+                # each sample carries its own per-head stack.
+                axes.append(
+                    AttentionAxis(
+                        name=SMILES_AXIS,
+                        per_sample_heads=[[h[i] for h in self._smiles] for i in range(n)],
+                    )
+                )
+
+            if self._gene:
+                gene = self._gene[0]
+                axes.append(
+                    AttentionAxis(
+                        name=GENE_AXIS,
+                        per_sample_heads=[[gene[i]] for i in range(n)],
+                    )
+                )
+
+            return axes
         finally:
-            # Always clear, including on a failed emit: a retained batch would
-            # otherwise be silently prepended to the next one.
             self.clear()
 
-    def send_workflow(self, params: dict[str, Any]) -> None:
-        """Record model identity on the workflow, once per run.
+    def _infer_batch_size(self) -> int:
+        source = self._smiles[0] if self._smiles else self._gene[0]
+        return len(source)
 
-        The vLLM connector sends tokenizer identity so token ids can be decoded
-        later; the analogue here is the SMILES language and the checkpoint.
-        """
-        keep = (
-            "smiles_language_filepath",
-            "smiles_vocabulary_size",
-            "smiles_padding_length",
-            "number_of_genes",
-            "multiheads",
-            "modelpath",
+    def emit(self, sample_ids, metadata=None, **kwargs: Any) -> list[str]:
+        """Emit the most recent forward pass. See :meth:`AttentionCapture.emit`."""
+        return super().emit(
+            sample_ids, metadata=metadata, n_samples=len(sample_ids), **kwargs
         )
-        conf = {k: params[k] for k in keep if k in params}
-        conf["model"] = "Paccmann_MCA"
-        conf["metric_reference"] = METRIC_REFERENCE
-        self.interceptor.send_model_workflow(self.workflow_id, conf)
 
-    def remove(self) -> None:
+    def workflow_conf(self, params: dict[str, Any] | None) -> dict[str, Any]:
+        return {k: params[k] for k in _WORKFLOW_KEYS if params and k in params}
+
+    def close(self) -> None:
         """Detach every hook. Safe to call more than once."""
-        for h in self._handles:
-            h.remove()
+        for handle in self._handles:
+            handle.remove()
         self._handles.clear()
 
-    def __enter__(self) -> "PaccmannCapture":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.remove()
+    # Kept as an alias: `remove()` reads naturally for hooks, and the original
+    # API used it.
+    remove = close

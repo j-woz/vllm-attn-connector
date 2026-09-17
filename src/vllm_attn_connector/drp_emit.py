@@ -53,13 +53,14 @@ producers measuring different things.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 __all__ = [
     "ATTENTION_ACTIVITY",
-    "reduce_heads",
-    "emit_sample",
     "emit_batch",
+    "emit_sample",
+    "reduce_heads",
 ]
 
 
