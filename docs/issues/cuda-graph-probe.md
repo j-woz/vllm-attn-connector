@@ -95,3 +95,61 @@ and count instead of emitting zeros. `FULL_AND_PIECEWISE` (the default),
 
 ## Evidence
 
+Job 3166843, facebook/opt-125m on the served path, three CUDA-graph
+configurations in one allocation. Each mode sends a reference prompt alone, then
+five sequential prompts, then six concurrent completions of different lengths,
+and every persisted record is checked, not a sample. The reference prompt is 373
+tokens and generates 23 decode tokens, so `sum(attn_sum)` must be 23, one
+softmax unit per step.
+
+| mode | flags | records | ref `sum(attn_sum)` | value checks |
+|---|---|---|---|---|
+| default | none, `FULL_AND_PIECEWISE` | 12/12 | 22.999989 | 79 pass, 2 threshold |
+| nograph | `cudagraph_mode=NONE` | 12/12 | 23.000006 | 80 pass, 1 threshold |
+| enforce_eager | `--enforce-eager` | 12/12 | 22.999998 | 10 unscored, 1 threshold |
+
+The same quantity was exactly 0.0 in the default mode before the fix.
+
+Graphs on against graphs off, same prompt at temperature 0, identical generated
+text:
+
+| comparison | max abs difference / max(attn_sum) | relative difference of totals |
+|---|---|---|
+| default vs enforce_eager | 1.053e-04 | 3.913e-07 |
+| default vs nograph | 1.249e-04 | 7.391e-07 |
+
+Per-record, default mode: retained mass plus residual equals 1 on every step
+(worst 5.0e-06), the attention sink at position 0 is 713x to 1063x the mean of
+the rest, and the mean adjacent Jaccard is 0.083 to 0.308, so the retained
+positions turn over step to step. That last number is the direct check that the
+replayed copy really does rewrite the buffer: a buffer frozen at capture would
+give one query for the whole run and identical steps.
+
+The concurrency burst drives the decode batch from six requests down to one, so
+the connector logged scoring at widths 1, 2, 3, 4 and 5, padding to CUDA graph
+sizes 1, 2, 4 and 8, with nine distinct `matrix_shape` values per mode.
+`attn_connector: N decode step(s) unscored` never appeared in any of the three
+runs.
+
+The two threshold failures are the harness's own bound on
+`decode_steps_unscored`, the counter this fix adds, not a value check. Mixed
+prefill+decode steps have never been scored and are now counted rather than
+silently dropped; under a six-way concurrent burst the shortest requests spend
+several of their few decode steps in batches that are still prefilling someone
+else. The default and nograph modes recorded the same 13 such steps and
+enforce_eager 10, which is what shows they are scheduler behaviour and not a
+graph artifact. On every record `decode_steps_recorded + decode_steps_unscored`
+equals the decode tokens generated.
+
+`tests/e2e_smoke.py` on Qwen/Qwen2.5-0.5B-Instruct: FAILURES 0 with
+`enforce_eager=True` and FAILURES 0 with `--cuda-graphs`.
+`pytest tests/test_aggregations.py` passes, including the new GPU-free coverage
+of the registry's freshness rules.
+
+Two earlier jobs in the same campaign failed, both caught by the warnings this
+fix adds rather than by silence:
+
+| job | what happened |
+|---|---|
+| 3166664 | every decode step unscored. The buffer was sized `min(max_cudagraph_capture_size, max_num_seqs)` = 512, and vLLM warms up at `max_num_seqs` = 1024 after capture finishes, so the buffer grew and all 51 graphs lost their copy. The same job also showed the connector reading cudagraph key `None` on every step while the probe had recorded 51 keys, which is what moved the freshness signal into the probe. |
+| 3166820 | the validation script's own staleness check asserted a symbol the redesign had removed. |
