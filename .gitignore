@@ -2,3 +2,9 @@ __pycache__/
 *.egg-info/
 *.pyc
 output/
+
+# Read-only reference checkouts of vllm, flowcept and Paccmann_MCA.
+# Not dependencies: pyproject.toml declares none, and the host environment
+# supplies vllm and flowcept at runtime. Pinned revisions are recorded in
+# Transcript.adoc under "Vendored sources".
+deps/
