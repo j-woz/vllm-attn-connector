@@ -104,8 +104,169 @@ def main() -> int:
     test_segments()
     print()
     test_group_block_ids()
+    print()
+    test_graph_key()
+    print()
+    test_registry_freshness()
     print("\nall checks passed")
     return 0
+
+
+# --------------------------------------------------------------------------
+# Query registry keying and freshness. The probe half of the CUDA-graph fix,
+# and the part that has no GPU in it.
+# --------------------------------------------------------------------------
+
+def _load_probe():
+    """Pull QueryRegistry and graph_key_of out of probe.py without importing it.
+
+    probe.py imports vllm.logger at module scope; these two do not need it.
+    """
+    import ast as _ast
+    import pathlib
+    import threading
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src/vllm_attn_connector/probe.py").read_text()
+    tree = _ast.parse(src)
+    want = {"QueryRegistry", "graph_key_of", "_capturing"}
+    mod = _ast.Module(body=[n for n in tree.body
+                            if isinstance(n, (_ast.ClassDef, _ast.FunctionDef))
+                            and n.name in want],
+                      type_ignores=[])
+
+    class _Log:
+        def warning(self, *a, **k):
+            pass
+
+    ns = {"torch": torch, "threading": threading, "logger": _Log(), "Any": object}
+    exec(compile(mod, "<probe>", "exec"), ns)
+    missing = want - set(ns)
+    assert not missing, f"probe.py no longer defines {sorted(missing)}"
+    return ns["QueryRegistry"], ns["graph_key_of"]
+
+
+class _Desc:
+    """Stands in for vllm.forward_context.BatchDescriptor: frozen, so it is
+    hashable and compares by value, which is what makes a capture-time key and
+    a replay-time key the same key."""
+
+    __slots__ = ("num_tokens", "uniform")
+
+    def __init__(self, num_tokens, uniform=True):
+        object.__setattr__(self, "num_tokens", num_tokens)
+        object.__setattr__(self, "uniform", uniform)
+
+    def __eq__(self, other):
+        return (isinstance(other, _Desc) and other.num_tokens == self.num_tokens
+                and other.uniform == self.uniform)
+
+    def __hash__(self):
+        return hash((self.num_tokens, self.uniform))
+
+    def __repr__(self):
+        return f"_Desc({self.num_tokens}, {self.uniform})"
+
+
+class _Mode:
+    def __init__(self, name, value):
+        self.name, self.value = name, value
+
+    def __eq__(self, other):
+        return isinstance(other, _Mode) and other.value == self.value
+
+    def __hash__(self):
+        return hash(self.value)
+
+    def __repr__(self):
+        return self.name
+
+
+NONE, PIECEWISE, FULL = _Mode("NONE", 0), _Mode("PIECEWISE", 1), _Mode("FULL", 2)
+
+
+class _Ctx:
+    def __init__(self, mode, desc):
+        self.cudagraph_runtime_mode, self.batch_descriptor = mode, desc
+
+
+def test_graph_key() -> None:
+    _, graph_key_of = _load_probe()
+    print("cudagraph key derived from the forward context")
+
+    assert graph_key_of(None) is None
+    assert graph_key_of(_Ctx(NONE, _Desc(7, False))) is None, \
+        "CUDAGraphMode.NONE means no graph will be replayed"
+    assert graph_key_of(_Ctx(FULL, None)) is None
+    print("  ok  no graph in play -> None, so the eager path keeps one entry")
+
+    k = graph_key_of(_Ctx(FULL, _Desc(16)))
+    assert k == graph_key_of(_Ctx(FULL, _Desc(16))), \
+        "capture and replay of one graph must produce equal keys"
+    assert hash(k) == hash(graph_key_of(_Ctx(FULL, _Desc(16))))
+    print("  ok  the same graph gives the same key at capture and at replay")
+
+    assert k != graph_key_of(_Ctx(FULL, _Desc(32))), "one graph per padded size"
+    assert k != graph_key_of(_Ctx(PIECEWISE, _Desc(16))), \
+        "piecewise and full are different graphs at the same size"
+    print("  ok  padded size and runtime mode both separate graphs")
+
+
+def test_registry_freshness() -> None:
+    QueryRegistry, _ = _load_probe()
+    print("query registry: persistent buffers, per-step freshness")
+
+    reg = QueryRegistry()
+    reg.configure(8)
+    q = torch.arange(8 * 2 * 3, dtype=torch.float32).reshape(8, 2, 3)
+
+    # --- eager: fresh only for the step it ran on -------------------------
+    reg.put("l0", q, 3, None)
+    assert reg.get("l0", None) is not None, "a live write is readable this step"
+    assert torch.equal(reg.get("l0", None)[:3], q[:3])
+    reg.end_step()
+    assert reg.get("l0", None) is None, \
+        "a live write must not survive into the next step"
+    print("  ok  eager write is fresh for its own step and stale after it")
+
+    # --- graph: the recorded copy makes it fresh on every replay ----------
+    gk = ("FULL", 16)
+    reg.put("l0", q, 8, gk)
+    for _ in range(50):
+        reg.end_step()
+    assert reg.get("l0", gk) is not None, \
+        "a graph's copy kernel reruns on every replay; the key must stay valid"
+    assert reg.get("l0", ("FULL", 32)) is None, \
+        "a different graph's key must not read this buffer"
+    assert reg.get("l0", None) is None, "an eager step must not read a graph write"
+    assert reg.get("nosuch", gk) is None
+    print("  ok  graph key stays fresh across steps; other keys do not match")
+
+    # --- the buffer is the same object, which is what replay depends on ---
+    before = reg.get("l0", gk)
+    reg.put("l0", q * 2, 8, gk)
+    after = reg.get("l0", gk)
+    assert before.data_ptr() == after.data_ptr(), \
+        "the buffer must be written in place, not replaced"
+    assert torch.equal(after, q * 2)
+    print("  ok  writes land in the same buffer, in place")
+
+    # --- configure() sizes it once, so capture never has to grow it -------
+    assert reg.get("l0", gk).shape[0] == 8, "configure(8) sizes the buffer to 8"
+    reg.put("l0", q, 2, gk)
+    assert reg.get("l0", gk).data_ptr() == after.data_ptr(), \
+        "a smaller batch must not reallocate"
+    print("  ok  a smaller batch reuses the buffer")
+
+    # --- growing after capture costs the graphs recorded against the old --
+    small = QueryRegistry()
+    small.put("l0", q, 2, gk)
+    assert small.get("l0", gk) is not None
+    gk2 = ("FULL", 64)
+    small.put("l0", q, 8, gk2)
+    assert small.get("l0", gk) is None, \
+        "graphs recorded against the old buffer no longer write the new one"
+    assert small.get("l0", gk2) is not None
+    print("  ok  a buffer that has to grow drops the keys it invalidates")
 
 
 # --------------------------------------------------------------------------

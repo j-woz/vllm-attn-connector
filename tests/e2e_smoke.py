@@ -6,6 +6,11 @@ validates the Flowcept records -- including that the recomputed attention is
 real attention and not a plausible-looking artifact.
 
 Run: python e2e_smoke.py --model Qwen/Qwen2.5-0.5B-Instruct
+
+`--cuda-graphs` drops `enforce_eager` and runs the configuration `vllm serve`
+uses by default. That path has its own failure mode -- the probe's Python body
+runs only while vLLM captures the graph, never on a replayed step -- so the
+eager-only default here is what let issue #2 reach production untested.
 """
 
 from __future__ import annotations
@@ -63,8 +68,10 @@ def run(args) -> list[dict]:
             ),
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=True,
+            enforce_eager=not args.cuda_graphs,
         )
+        print(f"\n=== enforce_eager={not args.cuda_graphs} "
+              f"(cuda graphs {'ON' if args.cuda_graphs else 'off'}) ===")
         # ignore_eos: every prompt must produce exactly MAX_TOKENS tokens.
         # Without it a model that stops early leaves a record with a single
         # decode step, and the unbounded-growth checks below fail for a
@@ -278,6 +285,9 @@ def main() -> int:
     ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.55)
+    ap.add_argument("--cuda-graphs", action="store_true",
+                    help="run with vLLM's default CUDA graphs instead of "
+                         "enforce_eager; exercises the replayed-decode path")
     ap.add_argument("--ranges", action="store_true",
                     help="declare per-request prompt ranges (variable segments)")
     ap.add_argument("--max-steps", type=int, default=0,
