@@ -224,6 +224,10 @@ Stated rather than faked:
 
 ### Environment
 
+Both models must be trained first. **`docs/model-setup.md`** is the full path —
+environment, the 1.4 GB benchmark download, the patches each model needs, and
+the two silent failure modes to check for before trusting any number.
+
 ```bash
 conda activate spotter          # python 3.13, torch 2.14, tensorflow 2.21
 pip install pymongo redis       # for the provenance store
@@ -553,6 +557,14 @@ unknowns to a dedicated `<UNK>` slot.
 ---
 
 ## Reference
+
+### Documents
+
+| file | contents |
+|---|---|
+| `docs/model-setup.md` | training Paccmann and HiDRA from scratch, and the traps |
+| `docs/cancer-study.md` | this document: design, results, findings |
+| `docs/run-log.md` | verbatim transcript of one full pipeline run |
 
 ### Files
 
