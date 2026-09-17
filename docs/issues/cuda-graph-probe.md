@@ -46,22 +46,45 @@ a recorded kernel, so every replay of that graph refreshes the buffer with no
 Python involved. The buffer is never cleared between steps.
 
 Freshness is tracked instead of being implied by "the registry was rebuilt this
-step":
+step". The probe asks `torch.cuda.is_current_stream_capturing()`, so it knows
+whether its copy is being recorded into a graph or executed now:
 
-* A graph write counts for any step that replays that graph. The key is
-  `(cudagraph_runtime_mode, batch_descriptor)`, which is the pair vLLM's own
-  `CudagraphDispatcher` keys graphs by, and both the capturing forward and every
-  replay carry it in the forward context. `BatchDescriptor` is a frozen
-  dataclass, so the capture-time key and the replay-time key compare equal.
-* A live write counts only for the step it ran on, via a generation counter the
+* A recorded copy re-runs on every replay of that graph, so it stays valid
+  indefinitely. The probe remembers the largest decode batch it was recorded
+  for, and a decode step of no more rows than that replayed a graph that
+  rewrites the buffer.
+* A live copy counts only for the step it ran on, via a generation counter the
   connector bumps in `wait_for_save` where the `clear()` used to be.
+
+The first design keyed the buffers by the `(cudagraph_runtime_mode,
+batch_descriptor)` pair vLLM's own `CudagraphDispatcher` uses, on the assumption
+that the connector sees the same pair the probe saw at capture. It does not.
+vLLM 0.28 runs opt-125m on `v1/worker/gpu/model_runner.py`, which calls
+`post_forward`, and so `wait_for_save`, outside the `set_forward_context` block,
+and on the FULL path calls `pre_forward` outside it too, so `get_forward_context`
+is either unset or carries `cudagraph_runtime_mode = NONE` with no descriptor. In
+job 3166664 the probe recorded 51 graph keys during capture and the connector
+read `None` on every decode step. Asking whether a capture happened is a question
+the probe can answer for itself, and it does not depend on the runner's plumbing.
+
+That inference is sound for every cudagraph mode vLLM ships, because the
+dispatcher never sends a pure decode batch to a graph the probe skipped.
+`FULL_AND_PIECEWISE` and `FULL_DECODE_ONLY` capture a separate uniform-decode
+graph per size, which is what the probe records. `PIECEWISE` leaves attention
+outside the graph, so the probe runs live. A batch too wide for any graph runs
+eager, so the probe runs live. Plain `cudagraph_mode=FULL` is the exception, in
+"Limits of the fix" below.
 
 One buffer per layer and not one per graph: the capture sizes sum to roughly
 thirty times the largest one, so a clone per graph would have cost about 5 GB of
 extra GPU memory on granite-4.2-30b for no benefit, since each graph writes only
 the rows it owns and the connector reads only the rows the current step filled.
-`_configure_registry` sizes the buffers from `max_cudagraph_capture_size` when
-the worker connector is built, which is before `compile_or_warm_up_model` runs.
+`_configure_registry` sizes the buffers when the worker connector is built,
+which is before `compile_or_warm_up_model` runs, to the larger of
+`max_cudagraph_capture_size` and `max_num_seqs`. The larger, not the smaller:
+vLLM warms up at `max_num_seqs` rows after capture has finished, and a buffer
+that grows at that point leaves every already-recorded copy writing into the old
+one. Job 3166664 did exactly that, 512 against 1024, and lost all 51 graphs.
 
 Three supporting changes:
 
@@ -81,8 +104,12 @@ Three supporting changes:
   reading them.
 
 `tests/e2e_smoke.py` takes a `--cuda-graphs` flag that drops `enforce_eager`,
-and `tests/test_aggregations.py` covers the key derivation and the freshness
-rules with no GPU.
+and `tests/test_aggregations.py` covers the freshness rules with no GPU: a live
+write is fresh only for its own step, a recorded write stays fresh across steps
+up to the rows it covers, a decode batch wider than any captured graph is
+refused, a registry with no recorded copy refuses every later step, writes land
+in the same buffer in place, and a buffer that has to grow drops the coverage it
+invalidates and warns.
 
 ## Limits of the fix
 
@@ -92,6 +119,16 @@ captured with `max_query_len != 1`, so the probe skips them and no copy is
 recorded. Decode steps under that setting are still unscored, but they now warn
 and count instead of emitting zeros. `FULL_AND_PIECEWISE` (the default),
 `FULL_DECODE_ONLY`, `PIECEWISE` and `NONE` all capture queries.
+
+Mixed prefill+decode steps are still not scored, in any mode. `max_query_len !=
+1` breaks the "batch row i is request slot i" identity the probe relies on, so
+the probe skips them and the connector refuses them. That is unchanged by this
+fix; what changed is that they are counted as `decode_steps_unscored` instead of
+disappearing. Under concurrency it is a real cost: in the validation run six
+simultaneous requests lost 13 of about 200 decode steps that way, concentrated
+in the shortest requests, whose decodes overlap the others' prefills. Scoring
+them would mean finding the decode prefix of a mixed batch from
+`query_start_loc`, which a captured graph cannot do with a fixed row count.
 
 ## Evidence
 
@@ -106,7 +143,7 @@ softmax unit per step.
 |---|---|---|---|---|
 | default | none, `FULL_AND_PIECEWISE` | 12/12 | 22.999989 | 79 pass, 2 threshold |
 | nograph | `cudagraph_mode=NONE` | 12/12 | 23.000006 | 80 pass, 1 threshold |
-| enforce_eager | `--enforce-eager` | 12/12 | 22.999998 | 10 unscored, 1 threshold |
+| enforce_eager | `--enforce-eager` | 12/12 | 22.999998 | 80 pass, 1 threshold |
 
 The same quantity was exactly 0.0 in the default mode before the fix.
 
