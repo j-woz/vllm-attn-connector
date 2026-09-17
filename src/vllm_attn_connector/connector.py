@@ -441,6 +441,7 @@ class _WorkerSide:
         self._top_pct = max(0.0, float(top_pct))
         self._chunk = max(0, int(chunk))
         self._layer_stats = bool(layer_stats)
+        self._missing_q = 0
 
         self._groups = [(list(g.layer_names), g.kv_cache_spec)
                         for g in kv_cache_config.kv_cache_groups]
@@ -540,6 +541,18 @@ class _WorkerSide:
 
     # -- per-step ----------------------------------------------------------- #
 
+    def _warn_no_query(self, layer_name: str, rows: int) -> None:
+        """Complain once. A silent skip here produces all-zero records that pass
+        every structural check -- mass still "conserves", because 0 + 1 == 1."""
+        self._missing_q += 1
+        if self._missing_q == 1:
+            logger.warning(
+                "attn_connector: no decode queries for layer %s at %d row(s) "
+                "(buffer capacity %d). Scores for this step will be zero. If "
+                "this persists the probe is not reaching the forward -- check "
+                "install_probe() ran before the engine was built.",
+                layer_name, rows, REGISTRY.max_rows)
+
     def score_step(self, meta: AttnMetadata) -> None:
         """Score the decode queries this step produced, on the side stream."""
         if not self._enabled or not meta.scheduled:
@@ -564,13 +577,19 @@ class _WorkerSide:
             return sr.num_computed_tokens >= n_prompt if n_prompt else True
 
         decoding = [s for s in meta.scheduled if _is_decode(s)]
-        n_probe = REGISTRY.num_decode_reqs
-        if decoding and n_probe and n_probe != len(decoding):
-            logger.warning(
-                "attn_connector: probe saw %d decode rows but the scheduler lists %d; "
-                "skipping this step rather than mis-attributing.", n_probe, len(decoding)
-            )
-            decoding = []
+        # Under CUDA graphs the probe's Python does not run on replay, so it has
+        # no count to cross-check against; the scheduler's is the only one. When
+        # it *did* run (eager), disagreement means the batch is not laid out the
+        # way decode assumes, so drop the step rather than mis-attribute.
+        if decoding and REGISTRY.ran_eagerly:
+            n_probe = REGISTRY.num_decode_reqs
+            if n_probe != len(decoding):
+                logger.warning(
+                    "attn_connector: probe saw %d decode rows but the scheduler lists %d; "
+                    "skipping this step rather than mis-attributing.", n_probe, len(decoding)
+                )
+                decoding = []
+        n_rows = len(decoding)
 
         with torch.cuda.stream(stream):
             for step_req in meta.scheduled:
@@ -635,8 +654,9 @@ class _WorkerSide:
                     row.zero_()
                     st.owner[gi, :n_keys].fill_(-1)
                     for li, layout in enumerate(group.layers):
-                        q = REGISTRY.get(layout.layer_name)
+                        q = REGISTRY.get(layout.layer_name, n_rows)
                         if q is None:
+                            self._warn_no_query(layout.layer_name, n_rows)
                             continue
                         probs = decode_attention(
                             q[row_i], layout.k_view, st.table, n_keys,
@@ -1008,6 +1028,12 @@ class AttnConnector(KVConnectorBase_V1, SupportsHMA):
             parent = extra.get("workflow_id")
             wf = f"vllm-attn-{uuid.uuid4().hex[:12]}"
             logger.info("attn_connector: workflow_id=%s parent=%s", wf, parent)
+            # Size the probe's buffers before anything runs a forward. They
+            # must exist before the first CUDA graph is captured, because each
+            # graph records the buffer's address; reallocating later would
+            # leave already-captured graphs writing somewhere nobody reads.
+            REGISTRY.max_rows = int(
+                getattr(vllm_config.scheduler_config, "max_num_seqs", 0) or 256)
             self._worker = _WorkerSide(
                 kv_cache_config, conf=_model_conf(vllm_config),
                 tp_size=vllm_config.parallel_config.tensor_parallel_size,
@@ -1068,9 +1094,13 @@ class AttnConnector(KVConnectorBase_V1, SupportsHMA):
             if isinstance(meta, AttnMetadata):
                 self._worker.score_step(meta)
         finally:
-            # Unconditional: stale queries must never survive into a later step,
-            # including the early-return paths inside score_step.
-            REGISTRY.clear()
+            # The registry is not cleared here. Its buffers are the destination
+            # the probe's copy kernel writes into, and under CUDA graphs that
+            # kernel is all that runs -- dropping the buffers would leave every
+            # later step with nothing to read. Freshness comes from the copy
+            # having run, not from the entry being new; `begin_step` below marks
+            # whether Python ran so the connector can tell the two apart.
+            REGISTRY.begin_step()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return

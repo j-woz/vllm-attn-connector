@@ -63,7 +63,7 @@ def run(args) -> list[dict]:
             ),
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=True,
+            enforce_eager=args.enforce_eager,
         )
         sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
         if args.ranges:
@@ -162,6 +162,17 @@ def validate(buffer: list[dict], *, num_requests: int, top_pct: float,
         check(steps == MAX_TOKENS - 1,
               f"unbounded: every decode token recorded ({steps} of {MAX_TOKENS - 1})")
     check(len(gen["attn_sum"]) == n_keys, f"attn_sum spans the prompt ({n_keys})")
+    # Attention is a softmax, so each scored decode step contributes exactly one
+    # unit of mass across the prompt. Anything near zero means the scores were
+    # never written -- the failure mode when the probe does not survive CUDA
+    # graph replay, which passes every structural check below because a row of
+    # zeros still "conserves mass" as 0 + 1 == 1.
+    total = sum(gen["attn_sum"])
+    check(abs(total - steps) < 0.05 * max(1, steps),
+          f"attn_sum totals one softmax unit per decode step "
+          f"({total:.4f} vs {steps} steps)")
+    check(total > 0, "ATTENTION IS NON-ZERO -- if this fails the probe never ran; "
+                     "check install_probe() preceded engine construction")
 
     check(width == eff_k, f"matrix width is k ({width})")
     for f in ("topk_head", "topk_pos", "topk_residual", "val_all_avg", "val_all_max"):
@@ -263,6 +274,10 @@ def main() -> int:
     ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.55)
+    ap.add_argument("--enforce-eager", action="store_true",
+                    help="disable CUDA graphs; the default runs with them ON, "
+                         "because that is how vllm serve runs and the probe has "
+                         "to survive graph replay")
     ap.add_argument("--ranges", action="store_true",
                     help="declare per-request prompt ranges (variable segments)")
     ap.add_argument("--max-steps", type=int, default=0,
