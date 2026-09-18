@@ -266,4 +266,5 @@ attention into Flowcept and turning it into OPAL-format evaluation chains.
 `docs/run-log.md` is a full transcript of one such run.
 
 For the papers behind the models and the wider framing, see
-`docs/reading-guide.md`.
+`docs/reading-guide.md`. For a single copy-pasteable sequence covering
+everything from environment to generated chains, see `docs/quickstart-gpu.md`.

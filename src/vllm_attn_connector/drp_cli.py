@@ -187,6 +187,34 @@ def cmd_capture_hidra(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def cmd_predictions(args: argparse.Namespace) -> int:
+    """Join an inference run into the table the chain builder needs.
+
+    ``*_infer_improve.py`` writes only ``auc_true,auc_pred`` -- the identifying
+    columns are dropped, so the predictions cannot be joined back to a cell
+    line or compound without the preprocessed y-data they came from. Row order
+    is the join key: both files are written from the same test set in the same
+    order.
+    """
+    import pandas as pd
+
+    ydata = pd.read_csv(args.ml_dir + "/test_y_data.csv")
+    preds = pd.read_csv(args.infer_dir + "/test_y_data_predicted.csv")
+    if len(ydata) != len(preds):
+        raise SystemExit(
+            f"row count mismatch: {len(ydata)} in test_y_data.csv vs "
+            f"{len(preds)} in test_y_data_predicted.csv -- these must come "
+            f"from the same run"
+        )
+
+    joined = pd.concat(
+        [ydata.reset_index(drop=True), preds.reset_index(drop=True)], axis=1
+    )[["cell_line", "drug", "auc_true", "auc_pred"]]
+    joined.to_csv(args.out, index=False)
+    print(f"wrote {len(joined)} predictions -> {args.out}")
+    return 0
+
+
 def cmd_chains(args: argparse.Namespace) -> int:
     from .drp_chains import build_chains, load_attention_from_store, write_csv
 
@@ -283,6 +311,14 @@ def build_parser() -> argparse.ArgumentParser:
     hd.add_argument("--limit", type=int, default=8)
     hd.add_argument("--seed", type=int, default=0)
     hd.set_defaults(func=cmd_capture_hidra)
+
+    pr = sub.add_parser(
+        "predictions", help="join inference output into a chain-ready table"
+    )
+    pr.add_argument("--ml-dir", required=True, help="preprocess output dir")
+    pr.add_argument("--infer-dir", required=True, help="inference output dir")
+    pr.add_argument("--out", required=True)
+    pr.set_defaults(func=cmd_predictions)
 
     ch = sub.add_parser("chains", help="build OPAL chains from stored provenance")
     ch.add_argument("--workflow-id", required=True)

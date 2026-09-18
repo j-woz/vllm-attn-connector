@@ -562,6 +562,7 @@ unknowns to a dedicated `<UNK>` slot.
 
 | file | contents |
 |---|---|
+| `docs/quickstart-gpu.md` | copy-pasteable end-to-end run on a GPU box |
 | `docs/reading-guide.md` | papers, repos and docs, in the order to read them |
 | `docs/model-setup.md` | training Paccmann and HiDRA from scratch, and the traps |
 | `docs/cancer-study.md` | this document: design, results, findings |
