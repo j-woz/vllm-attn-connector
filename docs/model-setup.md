@@ -264,3 +264,6 @@ with capture installed.
 With both models trained, `docs/cancer-study.md` covers capturing their
 attention into Flowcept and turning it into OPAL-format evaluation chains.
 `docs/run-log.md` is a full transcript of one such run.
+
+For the papers behind the models and the wider framing, see
+`docs/reading-guide.md`.

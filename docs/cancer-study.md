@@ -562,6 +562,7 @@ unknowns to a dedicated `<UNK>` slot.
 
 | file | contents |
 |---|---|
+| `docs/reading-guide.md` | papers, repos and docs, in the order to read them |
 | `docs/model-setup.md` | training Paccmann and HiDRA from scratch, and the traps |
 | `docs/cancer-study.md` | this document: design, results, findings |
 | `docs/run-log.md` | verbatim transcript of one full pipeline run |
