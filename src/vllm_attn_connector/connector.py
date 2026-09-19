@@ -253,7 +253,7 @@ class _RequestState:
                  "prompt_len", "steps", "dropped", "prompt_token_ids", "event", "started",
                  "seen_computed", "restarts", "k", "plan", "seg_idx", "seg_live",
                  "seg_want", "seg_kmax", "ranges", "n_keys", "owner", "head",
-                 "winner", "lsum", "lwins", "hent", "hdev", "hcnt", "hpos", "hval", "hmass")
+                 "lsum", "lwins", "hent", "hdev", "hcnt", "hpos", "hval", "hmass")
 
     def __init__(self, prompt_token_ids: list[int] | None):
         self.blocks: list[int] = []
@@ -281,7 +281,6 @@ class _RequestState:
         self.n_keys = 0
         self.owner = None
         self.head = None
-        self.winner = None
         self.lsum = None
         self.lwins = None
         self.hent = None
@@ -341,11 +340,7 @@ class _RequestState:
         # and may differ, so a merely-zeroed buffer of the old width would not fit.
         # Width must track n_keys: a restart refreezes the plan against a
         # possibly different prompt length.
-        if self.winner is not None and self.winner.shape[1] < n_keys:
-            self.winner = None
-        if layer_stats and self.winner is None:
-            self.winner = torch.full((groups, max(256, n_keys)), -1,
-                                     dtype=torch.int32, device=device)
+        if layer_stats and self.lwins is None:
             self.lsum = torch.zeros((groups, n_layers), dtype=torch.float64,
                                     device=device)
             # [bucket, groups, layer*heads]: bucket 0 = the first decode token,
@@ -387,7 +382,7 @@ class _RequestState:
     def reset_buffers(self) -> None:
         # Drop, not zero: a restart recomputes the selection plan, so the
         # per-step buffers may need a different width.
-        self.pos = self.val = self.resid = self.winner = None
+        self.pos = self.val = self.resid = None
         self.owner = self.head = None
         self.hpos = self.hval = None
         self.plan = []
@@ -441,6 +436,7 @@ class _WorkerSide:
         self._top_pct = max(0.0, float(top_pct))
         self._chunk = max(0, int(chunk))
         self._layer_stats = bool(layer_stats)
+        self._missing_q = 0
 
         self._groups = [(list(g.layer_names), g.kv_cache_spec)
                         for g in kv_cache_config.kv_cache_groups]
@@ -540,6 +536,18 @@ class _WorkerSide:
 
     # -- per-step ----------------------------------------------------------- #
 
+    def _warn_no_query(self, layer_name: str, rows: int) -> None:
+        """Complain once. A silent skip here produces all-zero records that pass
+        every structural check -- mass still "conserves", because 0 + 1 == 1."""
+        self._missing_q += 1
+        if self._missing_q == 1:
+            logger.warning(
+                "attn_connector: no decode queries for layer %s at %d row(s) "
+                "(buffer capacity %d). Scores for this step will be zero. If "
+                "this persists the probe is not reaching the forward -- check "
+                "install_probe() ran before the engine was built.",
+                layer_name, rows, REGISTRY.max_rows)
+
     def score_step(self, meta: AttnMetadata) -> None:
         """Score the decode queries this step produced, on the side stream."""
         if not self._enabled or not meta.scheduled:
@@ -564,13 +572,19 @@ class _WorkerSide:
             return sr.num_computed_tokens >= n_prompt if n_prompt else True
 
         decoding = [s for s in meta.scheduled if _is_decode(s)]
-        n_probe = REGISTRY.num_decode_reqs
-        if decoding and n_probe and n_probe != len(decoding):
-            logger.warning(
-                "attn_connector: probe saw %d decode rows but the scheduler lists %d; "
-                "skipping this step rather than mis-attributing.", n_probe, len(decoding)
-            )
-            decoding = []
+        # Under CUDA graphs the probe's Python does not run on replay, so it has
+        # no count to cross-check against; the scheduler's is the only one. When
+        # it *did* run (eager), disagreement means the batch is not laid out the
+        # way decode assumes, so drop the step rather than mis-attribute.
+        if decoding and REGISTRY.ran_eagerly:
+            n_probe = REGISTRY.num_decode_reqs
+            if n_probe != len(decoding):
+                logger.warning(
+                    "attn_connector: probe saw %d decode rows but the scheduler lists %d; "
+                    "skipping this step rather than mis-attributing.", n_probe, len(decoding)
+                )
+                decoding = []
+        n_rows = len(decoding)
 
         with torch.cuda.stream(stream):
             for step_req in meta.scheduled:
@@ -635,8 +649,9 @@ class _WorkerSide:
                     row.zero_()
                     st.owner[gi, :n_keys].fill_(-1)
                     for li, layout in enumerate(group.layers):
-                        q = REGISTRY.get(layout.layer_name)
+                        q = REGISTRY.get(layout.layer_name, n_rows)
                         if q is None:
+                            self._warn_no_query(layout.layer_name, n_rows)
                             continue
                         probs = decode_attention(
                             q[row_i], layout.k_view, st.table, n_keys,
@@ -698,12 +713,11 @@ class _WorkerSide:
                     st.colsum[gi, 0, :n_keys] += row[0]
                     torch.maximum(st.colsum[gi, 1, :n_keys], row[1],
                                   out=st.colsum[gi, 1, :n_keys])
-                    if st.winner is not None:
-                        w = st.winner[gi, :n_keys]
+                    if st.lwins is not None:
+                        w = st.owner[gi, :n_keys]
                         b = 0 if g_idx == 0 else 1
                         st.lwins[b, gi] += torch.bincount(
                             w[w >= 0].long(), minlength=st.lwins.shape[2]).double()
-                        w.fill_(-1)
                     if k:
                         # Select on the MAX aggregation: a mean over every
                         # (layer, head) pair buries whichever head is doing the
@@ -1008,6 +1022,12 @@ class AttnConnector(KVConnectorBase_V1, SupportsHMA):
             parent = extra.get("workflow_id")
             wf = f"vllm-attn-{uuid.uuid4().hex[:12]}"
             logger.info("attn_connector: workflow_id=%s parent=%s", wf, parent)
+            # Size the probe's buffers before anything runs a forward. They
+            # must exist before the first CUDA graph is captured, because each
+            # graph records the buffer's address; reallocating later would
+            # leave already-captured graphs writing somewhere nobody reads.
+            REGISTRY.max_rows = int(
+                getattr(vllm_config.scheduler_config, "max_num_seqs", 0) or 256)
             self._worker = _WorkerSide(
                 kv_cache_config, conf=_model_conf(vllm_config),
                 tp_size=vllm_config.parallel_config.tensor_parallel_size,
@@ -1068,9 +1088,7 @@ class AttnConnector(KVConnectorBase_V1, SupportsHMA):
             if isinstance(meta, AttnMetadata):
                 self._worker.score_step(meta)
         finally:
-            # Unconditional: stale queries must never survive into a later step,
-            # including the early-return paths inside score_step.
-            REGISTRY.clear()
+            REGISTRY.begin_step()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return

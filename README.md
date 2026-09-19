@@ -67,7 +67,22 @@ Two implementation notes that are easy to get wrong if you fork this:
 `Attention.forward` is traced through by `torch.compile`; only the custom op
 `unified_attention_with_output` survives as a runtime node, and it dispatches
 `self.impl.forward(...)` dynamically. An `nn.Module` forward hook would not fire
-under CUDA graphs.
+at all.
+
+**The query copy targets a persistent buffer, because CUDA graphs replay
+kernels and not Python.** Being on the traced path is necessary but not
+sufficient: a graph records the kernels a trace emits once, and replay re-runs
+only those kernels. Any Python in the probe — a dict write, an allocation —
+executes at capture time and never again. What does re-run is the copy itself,
+so the probe allocates one buffer per layer, sized to `max_num_seqs`, before
+capture, and every graph records a copy into a prefix of it. After any replay
+the first `m` rows hold the current step's queries.
+
+This matters because CUDA graphs are on by default in `vllm serve`. Getting it
+wrong is silent rather than loud: the connector still emits structurally valid
+records, they are just all zero, and even mass conservation still "passes"
+because `0 + 1 == 1`. The e2e therefore runs with graphs **on** by default and
+asserts that `attn_sum` totals one softmax unit per decode step.
 
 **Decode only.** In decode each request contributes exactly one query token, so
 batch row *i* is request slot *i* — no `query_start_loc` parsing and no
@@ -319,7 +334,8 @@ others do not.
 pytest tests/test_aggregations.py
 
 # end to end against a real engine
-python tests/e2e_smoke.py
+python tests/e2e_smoke.py                                 # CUDA graphs ON, as served
+python tests/e2e_smoke.py --enforce-eager                 # graphs off
 python tests/e2e_smoke.py --ranges                        # variable segments
 python tests/e2e_smoke.py --chunk-size 1 --top-pct 100    # full capture
 python tests/e2e_smoke.py --top-pct 25 --chunk-size 64
@@ -330,6 +346,10 @@ See [`tests/README.md`](tests/README.md) for what each covers, and for what is
 
 The e2e asserts 32 properties. The load-bearing ones:
 
+- **`attn_sum` totals one softmax unit per decode step.** Attention is a
+  distribution, so this is the check that the scores were actually written. It
+  is asserted separately from mass conservation because an all-zero capture
+  satisfies the latter trivially.
 - **`sum(val_all_avg) + topk_residual == 1`** at every step, so the output is a
   genuine probability distribution with the discarded mass accounted for
   exactly, not a plausible-looking artifact.

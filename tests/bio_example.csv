@@ -1,0 +1,258 @@
+chain_id,round_no,task_type,prompt,tool_ranges,correct_answer,explanation
+exp32-chain-0020-hard,1,dose_response_shape,"SESSION
+You are analysing experiment 32 at the Ashfield phenotyping facility: a cobalt
+(Co) dose series on 6 Brassica napus (oilseed rape) accessions at 0, 50, 100, 200,
+500 and 1000 mg kg-1, imaged over 28 days in six modalities.
+
+This is a 5-round investigation. Each round gives you the results of the tool
+calls it needs, already run; how many there are varies by round. Later rounds
+build on what you established earlier and will not repeat it, so keep your own
+answers.
+
+TOOLS (results are inlined; you cannot issue new calls)
+  db_lookup(table=, select=, where=, group_by=)   the measurement store
+  schema_lookup(trait=)                           which modality records a trait, and in what unit
+  qc_lookup(table=, select=, where=)              flags, exclusions, usable counts
+  design_lookup(aspect=)                          the protocol: dose series, accession panel,
+                                                  imaging rounds, replication plan
+  literature_lookup(species=, property=)          published claims
+  embedding_lookup(space=, query=, k=)            nearest accessions by profile similarity
+
+TERMS
+  treatment        the cobalt dose, in mg kg-1
+  genotype         the accession label
+  Fv/Fm_Lss        photosystem-II efficiency, from the fc1 modality
+  area_mm2         leaf area
+  n_plants         distinct plants behind a cell
+  round_to_round   variance of an accession's per-round means
+  within_round     variance between plants inside one imaging round
+
+ROUND 1 - TASK (dose_response_shape)
+At which cobalt dose does mean Fv/Fm_Lss peak across the panel?
+
+RULES
+1. Two rows in the store carry a similar trait name. Only the
+   plant-level trait is the panel measurement; the dictionary says
+   which that is.
+2. A treatment cell must clear the usable-plant floor in the quality
+   gate before it can be called a peak.
+3. Judge the curve as a whole, not a single cell.
+
+TOOL OUTPUTS
+
+>>> schema_lookup(trait=""Fv/Fm_Lss"")
+    trait dictionary: where the trait lives and at what entity level.
+    trait          modality  table       unit  entity_level
+    -------------  --------  ----------  ----  ------------
+    Fv/Fm_Lss      fc1       fc1_values  a.u.  plant
+    avg_Fv/Fm_Lss  fc1       fc1_values  a.u.  region
+
+>>> qc_lookup(table=""fc1_values"", select=[""treatment"", ""n_plants_usable""], where=""trait='Fv/Fm_Lss'"")
+    plants surviving QC per treatment; the floor for a panel claim is 15.
+    treatment  n_plants_usable
+    ---------  ---------------
+    0          5
+    50         57
+    100        60
+    200        50
+    500        54
+    1000       50
+
+>>> db_lookup(table=""fc1_values"", select=[""trait"", ""mean_value""], where=""experiment_id=32"", group_by=[""trait"", ""treatment""])
+    mean value by trait, one column per treatment (mg kg-1).
+    trait          t0     t50    t100   t200   t500   t1000
+    -------------  -----  -----  -----  -----  -----  -----
+    Fv/Fm_Lss      0.540  0.508  0.524  0.488  0.469  0.444
+    avg_Fv/Fm_Lss  0.416  0.468  0.402  0.430  0.436  0.599
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <dose in mg kg-1, digits only>
+","(schema_lookup[359:457],qc_lookup[457:545],db_lookup[545:696])",100,(depends on: -; the plant-level Fv/Fm_Lss row peaks at 0.524 on t100 -> 100; ablations: reading the alias row gives 1000; ignoring the quality gate gives 0 on 5 plants)
+exp32-chain-0020-hard,2,transition_sensitivity,"ROUND 2 - TASK (transition_sensitivity)
+Starting from the cobalt dose you identified in round 1, which accession
+loses the most Fv/Fm_Lss when the dose is raised to the next level of the
+design series?
+
+RULES
+1. The store also holds a pilot dose that is not a level of the
+   design series. The next level is the next one in the design
+   table, which need not be the next column.
+2. Only accessions in the core panel can be ranked; observational
+   ones are carried for reference.
+3. Compare each accession against itself across the two doses.
+
+TOOL OUTPUTS
+
+>>> design_lookup(aspect=""accession_panel"")
+    panel membership for this experiment.
+    genotype  panel_role
+    --------  -------------
+    RIL 161   core
+    NIL 373   core
+    73        observational
+    MAGIC 75  core
+    62        core
+
+>>> db_lookup(table=""fc1_values"", select=[""genotype"", ""mean_value""], where=""trait='Fv/Fm_Lss'"", group_by=[""genotype"", ""treatment""])
+    mean Fv/Fm_Lss by accession, one column per treatment in the store.
+    genotype  t0     t100   t150   t200
+    --------  -----  -----  -----  -----
+    RIL 161   0.548  0.541  0.525  0.500
+    NIL 373   0.522  0.499  0.345  0.325
+    73        0.549  0.536  0.499  0.196
+    MAGIC 75  0.557  0.549  0.508  0.318
+    62        0.538  0.509  0.468  0.429
+
+>>> design_lookup(aspect=""dose_series"")
+    the design levels, in order. Doses absent here are pilot cells.
+    level  treatment
+    -----  ---------
+    1      0
+    2      50
+    3      100
+    4      200
+    5      500
+    6      1000
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <accession label exactly as it appears in the table>
+","(design_lookup[113:166],db_lookup[166:329],design_lookup[329:382])",MAGIC 75,"(depends on: round 1 answer 100; the step is t100->t200, not the adjacent column t150 which is a pilot cell; per-accession drop MAGIC 75:+0.231  NIL 373:+0.174  62:+0.080  RIL 161:+0.041 -> MAGIC 75; ablations: stepping to the next column instead of the next design level gives NIL 373; ranking without the panel table gives 73, which is observational)"
+exp32-chain-0020-hard,3,cross_modality_peak,"ROUND 3 - TASK (cross_modality_peak)
+For the accession identified in round 2: at which dose does its leaf area
+(area_mm2) peak, and does that dose agree with where Fv/Fm_Lss peaked
+in round 1?
+
+RULES
+1. More than one modality reports this trait. Use the one the
+   dictionary marks primary; the other is a derived estimate.
+2. A cell flagged empty_mask carries no usable area and cannot be
+   the peak. low_mask_coverage is on nearly every row and is not a
+   reason to discard.
+3. The verdict is AGREES when the area peak falls on the dose from
+   round 1, and DISAGREES otherwise. Report both parts.
+
+TOOL OUTPUTS
+
+>>> schema_lookup(trait=""area_mm2"")
+    modalities reporting this trait.
+    trait     modality  modality_role       unit  trait_role
+    --------  --------  ------------------  ----  ----------
+    area_mm2  rgb2      top-view RGB        mm2   primary
+    area_mm2  swir      SWIR hyperspectral  mm2   derived
+
+>>> qc_lookup(table=""rgb2_features"", select=[""genotype"", ""treatment"", ""flag""], where=""flag='empty_mask'"")
+    cells voided by empty_mask.
+    genotype  treatment  flag
+    --------  ---------  ----------
+    MAGIC 75  1000       empty_mask
+    73        500        empty_mask
+
+>>> db_lookup(table=""features"", select=[""modality"", ""genotype"", ""mean_area_mm2""], where=""trait='area_mm2'"", group_by=[""modality"", ""genotype"", ""treatment""])
+    mean area_mm2 by modality and accession, one column per treatment.
+    modality  genotype  t0     t100   t500   t1000
+    --------  --------  -----  -----  -----  -----
+    rgb2      MAGIC 75  13.29  21.96  13.34  26.46
+    rgb2      73        12.53  15.02  23.86  14.68
+    rgb2      NIL 373   23.42  14.36  13.35  10.91
+    rgb2      RIL 161   12.21  14.29  15.67  24.87
+    swir      MAGIC 75  7.38   8.42   8.87   16.47
+    swir      73        7.81   9.45   10.59  17.80
+    swir      NIL 373   9.82   17.49  10.14  9.29
+    swir      RIL 161   18.51  11.00  10.15  8.51
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <dose in mg kg-1, digits only>; <AGREES or DISAGREES>
+","(schema_lookup[126:209],qc_lookup[209:288],db_lookup[288:513])",100; AGREES,(depends on: round 2 answer MAGIC 75 and round 1 answer 100; on the rgb2 row for MAGIC 75 the largest usable cell is t100 -> 100; AGREES; ablations: reading the swir rows gives 1000; DISAGREES; ignoring empty_mask gives 1000; DISAGREES)
+exp32-chain-0020-hard,4,modality_coverage,"ROUND 4 - TASK (modality_coverage)
+For the accession identified in round 2: which modalities hold usable feature
+rows for it in this experiment?
+
+RULES
+1. A modality never scheduled for this experiment does not count,
+   even if rows for it exist: those were carried over.
+2. A modality whose rows are all flagged holds nothing usable.
+3. List the modalities in the column order of the store table.
+
+TOOL OUTPUTS
+
+>>> qc_lookup(table=""features"", select=[""genotype"", ""modality"", ""n_usable""], group_by=[""genotype"", ""modality""])
+    rows surviving QC, one column per modality.
+    genotype  fc1  rgb2  msc1  vnir  swir  s3d
+    --------  ---  ----  ----  ----  ----  ---
+    MAGIC 75  0    56    63    0     19    35
+    73        36   57    64    25    0     0
+    NIL 373   0    60    61    0     0     15
+    RIL 161   0    57    62    16    0     0
+
+>>> design_lookup(aspect=""imaging_rounds"")
+    imaging rounds scheduled per modality for this experiment.
+    modality  records                   rounds_scheduled
+    --------  ------------------------  ----------------
+    fc1       chlorophyll fluorescence  49
+    rgb2      top-view RGB              22
+    msc1      multispectral             47
+    vnir      VNIR hyperspectral        43
+    swir      SWIR hyperspectral        0
+    s3d       3-D structural scan       34
+
+>>> db_lookup(table=""features"", select=[""genotype"", ""modality"", ""n_rows""], group_by=[""genotype"", ""modality""])
+    feature rows per accession, one column per modality.
+    genotype  fc1  rgb2  msc1  vnir  swir  s3d
+    --------  ---  ----  ----  ----  ----  ---
+    MAGIC 75  0    57    65    41    20    37
+    73        38   57    65    27    0     0
+    NIL 373   0    60    62    0     0     18
+    RIL 161   0    58    63    17    0     0
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <modalities, comma separated, in table column order>
+","(qc_lookup[82:198],design_lookup[198:297],db_lookup[297:414])","rgb2, msc1, s3d","(depends on: round 2 answer MAGIC 75; that row is non-zero for rgb2, msc1, vnir, swir, s3d, but swir was never scheduled and vnir has nothing left after QC -> rgb2, msc1, s3d; ablations: ignoring the schedule gives rgb2, msc1, swir, s3d; ignoring the quality gate gives rgb2, msc1, vnir, s3d)"
+exp32-chain-0020-hard,5,analogue_search,"ROUND 5 - TASK (analogue_search)
+For the accession identified in round 2: which accession is its nearest
+analogue by Fv/Fm_Lss dose-response profile, and does that analogue's own
+peak fall on the dose you identified in round 1?
+
+RULES
+1. Take the nearest neighbour that is eligible: observational
+   accessions cannot be analogues.
+2. Neighbours are listed in descending similarity.
+3. Report the analogue, then MATCHES if its own peak is the dose from
+   round 1 and DIVERGES if it is not.
+
+TOOL OUTPUTS
+
+>>> embedding_lookup(space=""dose_response_profile"", query=""panel"", k=3)
+    nearest accessions by Fv/Fm_Lss profile, for every panel member.
+    genotype  neighbour_1       neighbour_2       neighbour_3
+    --------  ----------------  ----------------  ----------------
+    MAGIC 75  73 (0.972)        NIL 373 (0.914)   RIL 161 (0.816)
+    73        NIL 373 (0.933)   MAGIC 75 (0.802)  RIL 161 (0.606)
+    NIL 373   MAGIC 75 (0.910)  73 (0.736)        RIL 161 (0.644)
+    RIL 161   NIL 373 (0.913)   73 (0.794)        MAGIC 75 (0.619)
+
+>>> design_lookup(aspect=""accession_panel"")
+    panel membership for this experiment.
+    genotype  panel_role
+    --------  -------------
+    MAGIC 75  core
+    73        observational
+    NIL 373   core
+    RIL 161   core
+
+>>> db_lookup(table=""fc1_values"", select=[""genotype"", ""peak_treatment""], where=""trait='Fv/Fm_Lss'"", group_by=[""genotype""])
+    the treatment at which each accession's own Fv/Fm_Lss is highest.
+    genotype  peak_treatment
+    --------  --------------
+    MAGIC 75  1000
+    73        100
+    NIL 373   0
+    RIL 161   1000
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <accession label>; <MATCHES or DIVERGES>
+","(embedding_lookup[101:283],design_lookup[283:334],db_lookup[334:427])",NIL 373; DIVERGES,"(depends on: round 2 answer MAGIC 75 and round 1 answer 100; the nearest eligible analogue is NIL 373, whose own peak is t0 -> NIL 373; DIVERGES; ablations: taking the nearest neighbour regardless of panel role gives 73; MATCHES)"
