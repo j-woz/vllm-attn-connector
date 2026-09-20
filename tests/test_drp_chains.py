@@ -331,12 +331,31 @@ def test_tool_ranges_empty_until_a_tokenizer_is_supplied():
     say("  ok  tool_ranges left empty rather than guessed")
 
 
-def test_add_tool_ranges_produces_contiguous_token_spans():
-    """Bogdan: ranges are tokenizer-dependent and history-dependent. Whatever
-    the tokenizer, the spans must tile without gaps, as they do in the original
-    (all 391 multi-range rows there are perfectly contiguous)."""
+class FakeTokenizer:
+    """Whitespace tokenizer with an offset mapping, like a HF fast tokenizer.
+
+    ``add_tool_ranges`` needs real character offsets, not a token count: token
+    counts do not compose across a boundary, so adding up the lengths of
+    substrings gives the wrong answer. This mimics the interface it relies on.
+    """
+
+    def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+        offsets, pos = [], 0
+        for word in text.split():
+            start = text.index(word, pos)
+            offsets.append((start, start + len(word)))
+            pos = start + len(word)
+        out = {"input_ids": list(range(len(offsets)))}
+        if return_offsets_mapping:
+            out["offset_mapping"] = offsets
+        return out
+
+
+def test_add_tool_ranges_produces_ordered_spans():
+    """Bogdan: ranges are tokenizer- and history-dependent. Whatever the
+    tokenizer, spans must be ordered, non-empty, and non-overlapping."""
     rows = _rows()
-    toks = add_tool_ranges(rows, tokenize=lambda s: s.split(), history=False)
+    toks = add_tool_ranges(rows, FakeTokenizer(), history=False)
 
     multi = 0
     for r in toks:
@@ -348,18 +367,46 @@ def test_add_tool_ranges_produces_contiguous_token_spans():
         assert all(a < b for a, b in spans), "empty or inverted span"
         if len(spans) > 1:
             multi += 1
-            assert all(spans[i][1] == spans[i + 1][0] for i in range(len(spans) - 1)), \
-                f"non-contiguous spans in {r['chain_id']} r{r['round_no']}"
-    assert multi > 0, "no multi-range rows to check contiguity on"
-    say(f"  ok  token spans tile contiguously ({multi} multi-range rows)")
+            assert all(spans[i][1] <= spans[i + 1][0] for i in range(len(spans) - 1)), \
+                f"overlapping spans in {r['chain_id']} r{r['round_no']}"
+    assert multi > 0, "no multi-range rows to check ordering on"
+    say(f"  ok  token spans are ordered and non-overlapping ({multi} multi-range rows)")
+
+
+def test_spans_actually_cover_the_tool_block():
+    """The whole point: the span must land on the tool block, not near it.
+
+    Reusing the CSV's own indices under a different tokenizer puts a block's
+    start 15-143 tokens away. This asserts the recomputed spans do not.
+    """
+    rows = _rows()
+    tok = FakeTokenizer()
+    toks = add_tool_ranges(rows, tok, history=False)
+
+    checked = 0
+    for original, row in zip(rows, toks):
+        if not row["tool_ranges"]:
+            continue
+        words = original["prompt"].split()
+        for name, lo, hi in re.findall(r"(\w+)\[(\d+):(\d+)\]", row["tool_ranges"]):
+            lo, hi = int(lo), int(hi)
+            covered = " ".join(words[lo:hi])
+            assert covered.startswith(">>>"), \
+                f"span does not start at the marker: {covered[:40]!r}"
+            assert name in covered.split("(")[0], \
+                f"span {name} does not contain its own call: {covered[:60]!r}"
+            checked += 1
+    assert checked > 0
+    say(f"  ok  every span starts at its >>> marker and contains its call ({checked})")
 
 
 def test_history_mode_shifts_offsets_forward():
     """With history prepended, round N's offsets must sit past round N-1's --
     they index the accumulated conversation, not the round alone."""
     rows = _rows()
-    solo = add_tool_ranges(rows, tokenize=lambda s: s.split(), history=False)
-    hist = add_tool_ranges(rows, tokenize=lambda s: s.split(), history=True)
+    tok = FakeTokenizer()
+    solo = add_tool_ranges(rows, tok, history=False)
+    hist = add_tool_ranges(rows, tok, history=True)
 
     def first(r):
         m = re.search(r"\[(\d+):", r["tool_ranges"])
@@ -374,6 +421,30 @@ def test_history_mode_shifts_offsets_forward():
             shifted += 1
     assert shifted > 0
     say(f"  ok  history mode shifts later rounds forward ({shifted} rounds)")
+
+
+def test_history_answer_choice_is_the_callers():
+    """Ground-truth history measures per-prompt accuracy; the model's own
+    answers measure per-chain accuracy. Both must be expressible."""
+    rows = _rows()
+    tok = FakeTokenizer()
+    truth = add_tool_ranges(rows, tok, history=True)
+    longer = add_tool_ranges(
+        rows, tok, history=True,
+        answer_template="\nANSWER: {answer} plus a much longer reply\n\n",
+    )
+
+    def first(r):
+        m = re.search(r"\[(\d+):", r["tool_ranges"])
+        return int(m.group(1)) if m else None
+
+    moved = sum(
+        1 for a, b in zip(truth, longer)
+        if a["round_no"] > 1 and first(a) is not None and first(b) is not None
+        and first(b) > first(a)
+    )
+    assert moved > 0, "a longer history must push later rounds further out"
+    say(f"  ok  answer text changes later offsets ({moved} rounds)")
 
 
 def _main():
@@ -391,8 +462,10 @@ def _main():
     test_answers_are_single_line()
     print("\ntool_ranges")
     test_tool_ranges_empty_until_a_tokenizer_is_supplied()
-    test_add_tool_ranges_produces_contiguous_token_spans()
+    test_add_tool_ranges_produces_ordered_spans()
+    test_spans_actually_cover_the_tool_block()
     test_history_mode_shifts_offsets_forward()
+    test_history_answer_choice_is_the_callers()
     print("\nall checks passed")
 
 

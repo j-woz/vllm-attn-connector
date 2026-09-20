@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import csv
 import random
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,6 +58,7 @@ __all__ = [
     "add_tool_ranges",
     "build_chains",
     "load_attention_from_store",
+    "load_feature_names_from_store",
     "register_task",
     "write_csv",
 ]
@@ -561,49 +563,130 @@ def _assign_panel_roles(rng: random.Random, per_line) -> dict[str, str]:
     return roles
 
 
-def add_tool_ranges(rows, tokenize: Callable[[str], list], history: bool = True):
-    """Fill ``tool_ranges`` with token offsets, given a tokenizer.
+def _tool_block_spans(text: str, offset: int = 0) -> list[tuple[str, int, int]]:
+    """Character spans of every ``>>> call(...)`` block in ``text``.
 
-    Left for the caller because the offsets are only meaningful against a
-    specific tokenizer, and because whether prior rounds are prepended changes
-    every number. ``history=True`` accumulates the conversation the way an
-    evaluation harness would; ``False`` scopes each round to itself.
+    A block runs from its ``>>>`` marker to the next one, or to ``OUTPUT
+    FORMAT`` if it is the last. Returns ``(tool_name, start, end)`` with
+    ``offset`` added, so spans can be located inside a larger conversation.
+    """
+    spans: list[tuple[str, int, int]] = []
+    for match in re.finditer(r"^>>> (\w+)", text, re.MULTILINE):
+        begin = match.start()
+        nxt = text.find("\n>>> ", begin + 1)
+        fmt = text.find("\nOUTPUT FORMAT", begin)
+        candidates = [x for x in (nxt, fmt) if x > 0]
+        stop = min(candidates) if candidates else len(text)
+        spans.append((match.group(1), offset + begin, offset + stop))
+    return spans
 
-    ``tokenize`` takes text and returns a token list -- ``enc.encode`` from
-    tiktoken, or a HF tokenizer's ``.encode``.
+
+def _char_to_token(offsets: Sequence[tuple[int, int]], lo: int, hi: int):
+    """Map a character span to a token span using an offset mapping.
+
+    Token counts do not compose across a boundary -- ``len(tok(a)) +
+    len(tok(b))`` is not ``len(tok(a + b))``, because a BPE merge can span the
+    join (``"ans" + "wer"`` is 2 tokens apart, 1 together). So offsets must
+    come from tokenising the *whole* text once, never from adding up pieces.
+    """
+    start = next((i for i, (a, b) in enumerate(offsets) if b > lo), None)
+    stop = next((i for i, (a, _) in enumerate(offsets) if a >= hi), len(offsets))
+    return start, stop
+
+
+def add_tool_ranges(
+    rows,
+    tokenizer,
+    history: bool = True,
+    answer_template: str = "\nANSWER: {answer}\n\n",
+):
+    """Fill ``tool_ranges`` with token spans, given a tokenizer.
+
+    Left out of ``build_chains`` because the spans are only meaningful against
+    one specific tokenizer and one specific history policy. Getting either
+    wrong fails silently -- you simply get attention attributed to the wrong
+    text -- so nothing is guessed here.
+
+    ``tokenizer``
+        A HuggingFace fast tokenizer. It is called with
+        ``return_offsets_mapping=True`` and the offsets are used to convert
+        character spans to token spans. A plain ``encode``-style callable is
+        *not* enough: counting tokens of substrings and adding them up is wrong
+        across boundaries (see :func:`_char_to_token`).
+
+    ``history``
+        ``True`` prepends each earlier round and its answer, so spans index the
+        accumulated conversation -- what an evaluation harness actually feeds
+        the model. ``False`` scopes each round to itself.
+
+        Which answer goes into the history is the caller's choice and decides
+        what is being measured: ground-truth answers give per-prompt accuracy,
+        the model's own replies give per-chain accuracy, where an early mistake
+        propagates. ``answer_template`` formats whatever is supplied.
+
+    Why the spans in ``data/opal_chains.csv`` cannot simply be reused: they were
+    recorded under the generator's own regex tokenizer, which splits far more
+    coarsely than BPE. On the reference chain a model produces 1.24-1.43x more
+    tokens for the same text, and the factor is not constant -- it depends on
+    how much of the prompt is numbers and punctuation. Used verbatim, a block's
+    start lands 15 to 143 tokens away from the block.
     """
     out = []
     prefix = ""
     current_chain = None
+
     for row in rows:
         if row["chain_id"] != current_chain:
             current_chain = row["chain_id"]
             prefix = ""
 
         text = prefix + row["prompt"] if history else row["prompt"]
-        base = len(tokenize(prefix)) if history else 0
+        spans = _tool_block_spans(row["prompt"], offset=len(prefix) if history else 0)
+
+        encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        offsets = [(a, b) for a, b in encoded["offset_mapping"] if b > a]
 
         ranges = []
-        body = row["prompt"]
-        marker = ">>> "
-        pos = body.find(marker)
-        while pos != -1:
-            nxt = body.find(marker, pos + 1)
-            end = nxt if nxt != -1 else body.find("OUTPUT FORMAT", pos)
-            if end == -1:
-                end = len(body)
-            call = body[pos + len(marker):body.find("(", pos)]
-            start_tok = base + len(tokenize(body[:pos]))
-            end_tok = base + len(tokenize(body[:end]))
-            ranges.append(f"{call}[{start_tok}:{end_tok}]")
-            pos = nxt
+        for name, lo, hi in spans:
+            start, stop = _char_to_token(offsets, lo, hi)
+            if start is not None and stop > start:
+                ranges.append(f"{name}[{start}:{stop}]")
 
         new = dict(row)
         new["tool_ranges"] = "(" + ",".join(ranges) + ")" if ranges else ""
         out.append(new)
+
         if history:
-            prefix = text + f"\nANSWER: {row['correct_answer']}\n\n"
+            prefix = text + answer_template.format(answer=row["correct_answer"])
+
     return out
+
+
+def load_feature_names_from_store(
+    workflow_id: str,
+    key: str = "pathway_order",
+    mongo_uri: str = "mongodb://localhost:27017",
+    db_name: str = "flowcept",
+) -> list[str] | None:
+    """Read the axis labels a capture recorded, if it recorded any.
+
+    ``AttentionCapture.send_workflow`` files model identity under
+    ``<workflow_id>:conf``. For HiDRA that includes ``pathway_order``, which is
+    the decoder for the emitted vectors -- without it, position 41 of a
+    186-wide distribution is meaningless.
+
+    Returns ``None`` when nothing was recorded, so the caller can fall back to
+    supplying labels explicitly.
+    """
+    from pymongo import MongoClient
+
+    db = MongoClient(mongo_uri)[db_name]
+    record = db["workflows"].find_one({"workflow_id": f"{workflow_id}:conf"})
+    if not record:
+        return None
+    conf = record.get("conf") or {}
+    names = conf.get(key)
+    return list(names) if names else None
 
 
 def load_attention_from_store(
@@ -658,7 +741,14 @@ def load_attention_from_store(
                 f"{len(feature_names)} feature names were supplied"
             )
 
-        sample_id = str(task.get("task_id", "")).split(":")[0]
+        # Task ids are "<sample>:g<n>", and a sample may itself be compound --
+        # HiDRA files a prediction as "<cell_line>::<compound>", because the
+        # same line attends differently to different drugs. Strip only the
+        # trailing ":g<n>", so those stay distinct: splitting on the first ":"
+        # collapsed 64 predictions into 29 and silently kept whichever arrived
+        # last.
+        task_id = str(task.get("task_id", ""))
+        sample_id = re.sub(r":g\d+$", "", task_id)
         ranked = sorted(zip(feature_names, values), key=lambda t: -t[1])
         out[sample_id] = [(f, float(v)) for f, v in ranked[:top_k]]
 

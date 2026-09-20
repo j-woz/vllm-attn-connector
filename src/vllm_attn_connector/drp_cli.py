@@ -147,14 +147,45 @@ def cmd_capture_paccmann(args: argparse.Namespace) -> int:
 
 
 def cmd_capture_hidra(args: argparse.Namespace) -> int:
+    """Capture HiDRA pathway attention over real preprocessed data.
+
+    The inputs are assembled exactly as ``MultiGenerator`` does at train time
+    (``hidra_utils.py:217-231``): one array per KEGG pathway holding that
+    pathway's genes for each sample, then the drug fingerprint. Getting the
+    column order wrong here would not raise -- the shapes still line up -- it
+    would just attribute attention to the wrong genes.
+    """
     import numpy as np
+    import pandas as pd
     from tensorflow.keras.models import load_model
 
     from .drp_hidra import HidraCapture
 
+    data_dir = Path(args.data_dir)
     model = load_model(str(Path(args.model_dir) / "model.h5"), compile=False)
-    with open(Path(args.data_dir) / "geneset.json") as handle:
+
+    with open(data_dir / "geneset.json") as handle:
         geneset = json.load(handle)
+
+    expr = pd.read_csv(data_dir / "cancer_ge_kegg.csv", index_col=0)
+    drugs = pd.read_csv(data_dir / "drug_ecfp4_nbits512.csv", index_col=0)
+    ydata = pd.read_csv(data_dir / f"{args.stage}_y_data.csv")
+
+    if args.limit:
+        ydata = ydata.head(args.limit)
+
+    # A response row names a (cell line, compound) pair; both must be present
+    # in the feature tables or the row cannot be scored.
+    usable = ydata[
+        ydata["improve_sample_id"].isin(expr.index)
+        & ydata["improve_chem_id"].isin(drugs.index)
+    ]
+    dropped = len(ydata) - len(usable)
+    if usable.empty:
+        raise SystemExit(
+            f"no rows in {args.stage}_y_data.csv have features in both "
+            f"cancer_ge_kegg.csv and drug_ecfp4_nbits512.csv"
+        )
 
     with _flowcept(args.workflow_id, "hidra_attention"):
         cap = HidraCapture(
@@ -162,22 +193,35 @@ def cmd_capture_hidra(args: argparse.Namespace) -> int:
             workflow_id=args.workflow_id,
             include_gene_level=args.gene_level,
         )
-        cap.send_workflow({"modelpath": str(Path(args.model_dir) / "model.h5")})
+        cap.send_workflow({
+            "modelpath": str(Path(args.model_dir) / "model.h5"),
+            "stage": args.stage,
+        })
 
-        n = args.limit or 8
-        rng = np.random.default_rng(args.seed)
-        inputs = [
-            rng.standard_normal((n, len(geneset[p]))).astype("float32")
-            for p in cap.pathway_names
-        ]
-        inputs.append(
-            rng.standard_normal((n, model.inputs[-1].shape[-1])).astype("float32")
-        )
-        cap.emit(inputs=inputs, sample_ids=[f"hidra-{i}" for i in range(n)])
+        total = 0
+        for start in range(0, len(usable), args.batch_size):
+            chunk = usable.iloc[start : start + args.batch_size]
+            samples = chunk["improve_sample_id"].tolist()
+            compounds = chunk["improve_chem_id"].tolist()
 
+            # One input per pathway, in the order HidraCapture discovered from
+            # the graph -- which is also the order the pathway softmax indexes.
+            inputs = [
+                expr.loc[samples, geneset[p]].to_numpy(dtype=np.float32)
+                for p in cap.pathway_names
+            ]
+            inputs.append(drugs.loc[compounds].to_numpy(dtype=np.float32))
+
+            # A prediction is a (cell line, compound) pair, so the id has to
+            # name both: the same line attends differently to different drugs.
+            ids = [f"{s}::{c}" for s, c in zip(samples, compounds)]
+            cap.emit(inputs=inputs, sample_ids=ids)
+            total += len(ids)
+
+    note = f" ({dropped} row(s) dropped for missing features)" if dropped else ""
     print(
-        f"captured {n} samples over {len(cap.pathway_names)} pathways "
-        f"to workflow {args.workflow_id!r}"
+        f"captured {total} samples over {len(cap.pathway_names)} pathways "
+        f"to workflow {args.workflow_id!r}{note}"
     )
     return 0
 
@@ -308,7 +352,9 @@ def build_parser() -> argparse.ArgumentParser:
     hd.add_argument("--data-dir", required=True)
     hd.add_argument("--workflow-id", required=True)
     hd.add_argument("--gene-level", action="store_true")
-    hd.add_argument("--limit", type=int, default=8)
+    hd.add_argument("--stage", default="test", choices=("train", "val", "test"))
+    hd.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
+    hd.add_argument("--limit", type=int, default=0, help="cap rows (0 = all)")
     hd.add_argument("--seed", type=int, default=0)
     hd.set_defaults(func=cmd_capture_hidra)
 

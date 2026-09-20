@@ -169,12 +169,20 @@ class AttentionCapture:
             activity=self.activity,
         )
 
-    def send_workflow(self, params: dict[str, Any] | None = None) -> None:
-        """Record model identity on the workflow, once per run.
+    def send_workflow(self, params: dict[str, Any] | None = None) -> str:
+        """Record model identity, once per run. Returns the id it was filed under.
 
         The vLLM connector sends tokenizer identity so token ids can be decoded
         later. The analogue here is whatever a reader needs to interpret a bare
         attention vector: the feature ordering, the checkpoint, the vocabulary.
+        Without it a 186-wide distribution is 186 anonymous numbers.
+
+        Filed under a **child** workflow id, with the caller's as parent.
+        ``Flowcept(workflow_id=X)`` has already registered X by the time this
+        runs, and Flowcept records a given workflow once -- re-registering X
+        here is silently dropped, taking the configuration with it. That is not
+        hypothetical: it is how a HiDRA run lost its ``pathway_order`` and left
+        the attention vectors undecodable.
         """
         conf = {
             "model": self.MODEL_NAME,
@@ -182,7 +190,11 @@ class AttentionCapture:
             "metric_reference": self.METRIC_REFERENCE,
         }
         conf.update(self.workflow_conf(params))
-        self.interceptor.send_model_workflow(self.workflow_id, conf)
+        conf_id = f"{self.workflow_id}:conf"
+        self.interceptor.send_model_workflow(
+            conf_id, conf, parent_workflow_id=self.workflow_id
+        )
+        return conf_id
 
     def __enter__(self) -> Self:
         return self
