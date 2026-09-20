@@ -315,6 +315,81 @@ until these three lines agree.
 - **HiDRA capture used random inputs.** R6 fed `standard_normal` arrays, so the
   pathway attention it recorded is structurally valid but not biologically
   meaningful. Only the Paccmann capture (R5) used real expression data.
+  *Fixed after this run — see the addendum below.*
 - **Attention is not causation.** High weight means consulted, not used
   affirmatively.
 - **Single node, CPU, hundreds of samples.** Nothing here is a scale test.
+
+
+---
+
+## Addendum, same day — HiDRA on real data
+
+R6 above fed random arrays. `capture-hidra` now reads the preprocessed tables
+and assembles inputs the way `MultiGenerator` does at train time.
+
+```bash
+python -m vllm_attn_connector.drp_cli capture-hidra \
+    --model-dir /tmp/hidra_out --data-dir /tmp/hidra_ml \
+    --workflow-id hidra-real-v2 --limit 64
+```
+```
+captured 64 samples over 186 pathways to workflow 'hidra-real-v2'
+```
+
+Two bugs surfaced immediately, both silent, both of the kind this project keeps
+producing — output that passes every structural check and is wrong.
+
+**`send_workflow` was being dropped.** It re-registered the caller's *own*
+workflow id, and Flowcept records a given workflow once, so the second
+registration vanished — taking `pathway_order` with it. The 186-wide vectors
+were therefore undecodable: position 41 meant nothing. It now files under
+`<workflow_id>:conf` with the caller's id as parent.
+
+**`load_attention_from_store` collapsed samples.** It split task ids on the
+first `:`, but HiDRA ids a prediction `<cell_line>::<compound>` — the same line
+attends differently to different drugs. 64 predictions became 29, silently
+keeping whichever arrived last. Now strips only a trailing `:g<n>`.
+
+With both fixed, the attention decodes to named pathways:
+
+```
+ACH-000046::Drug_1005   KEGG_FC_GAMMA_R_MEDIATED_PHAGOCYTOSIS   0.0104
+ACH-000046::Drug_1507   KEGG_AXON_GUIDANCE                      0.0111
+ACH-000046::Drug_490    KEGG_MELANOGENESIS                      0.0103
+ACH-000052::Drug_1040   KEGG_HYPERTROPHIC_CARDIOMYOPATHY_HCM    0.0096
+```
+
+28 distinct pathways win across 64 predictions. Note the first three rows: one
+cell line, three compounds, three different winning pathways -- which is why
+the id has to name the pair.
+
+**But read those with care.** Uniform over 186 pathways is 0.0054, and the
+observed maximum is 0.0113 — **2.1x uniform**. Compare Paccmann's gene axis,
+where PARN takes 0.9988, three orders of magnitude above second place. After 2
+epochs HiDRA has barely learned to discriminate pathways, so the ranking above
+is weak evidence at best. Worth re-checking at 20 epochs.
+
+## Addendum — tool_ranges
+
+R10 recorded `tool_ranges empty: True` as intentional, pending a tokenizer.
+`add_tool_ranges` now computes them, using `return_offsets_mapping` over the
+whole text rather than summing token counts of substrings — which was the
+previous implementation and was wrong, because a BPE merge can span a join.
+
+Verified against gpt2 on all 24 chains:
+
+```
+rows with ranges : 96 / 96
+total spans      : 192
+spans decoded    : 192/192 start at their own >>> block
+round 1          : (db_lookup[623:795],qc_lookup[796:895])
+round 2          : (db_lookup[1025:1233],design_lookup[1234:1384])
+```
+
+Round 2's offsets sit past round 1's, because history mode indexes the
+accumulated conversation rather than the round alone.
+
+The shipped `data/cancer_opal_chains.csv` still has the column empty, which is
+correct: the spans are only meaningful against the tokenizer of whichever model
+is being evaluated.

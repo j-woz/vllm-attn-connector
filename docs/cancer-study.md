@@ -420,21 +420,44 @@ anything. They are derived deterministically from a seed and recorded in the
 explanation, so a reviewer can see which rows were marked and why. The
 measurements they gate are real.
 
-### tool_ranges is deliberately empty
+### tool_ranges is left empty in the shipped CSV, and filled on use
 
 The ranges in the original look like `(db_lookup[303:429])`. They are **token**
 offsets, not character offsets — measured ratio ~3:1 chars per unit, and all
 391 multi-range rows tile perfectly contiguously.
 
-Bogdan confirmed two dependencies: the tokenizer of the model under evaluation,
-and how much prior-round history is prepended (chains are evaluated with either
-ground-truth history, for per-prompt accuracy, or the model's own answers, for
-per-chain accuracy).
+They depend on two things neither of which the generator can know: the
+tokenizer of the model under evaluation, and how much prior-round history is
+prepended. Bogdan's `e2e_example.py` quantifies the cost of ignoring that — the
+CSV spans were recorded under the generator's own regex tokenizer, and under a
+BPE vocabulary the same text yields 1.24–1.43× more tokens, putting a block's
+start **15 to 143 tokens away** from the block. Nothing errors; attention is
+just attributed to the wrong text.
 
-Neither is known here, so the column is left empty rather than guessed.
-`add_tool_ranges(rows, tokenize=..., history=...)` fills it once you supply a
-tokenizer. Writing character offsets would produce a file that looks right and
-scores wrong.
+So the column ships empty and is computed at evaluation time:
+
+```python
+from transformers import AutoTokenizer
+from vllm_attn_connector.drp_chains import add_tool_ranges
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
+rows = add_tool_ranges(rows, tok, history=True)
+```
+
+`add_tool_ranges` needs a **fast tokenizer**, not an `encode` callable: it uses
+`return_offsets_mapping` to convert character spans to token spans over the
+whole text at once. Counting tokens of substrings and adding them up is wrong,
+because a BPE merge can span the join — `"ans"` + `"wer"` is two tokens apart
+and one together.
+
+`history=True` prepends each earlier round and its answer, so spans index the
+accumulated conversation. Which answer goes in is the caller's choice and
+decides what is measured: ground truth gives per-prompt accuracy, the model's
+own replies give per-chain accuracy, where an early mistake propagates.
+`answer_template` formats whatever is supplied.
+
+Verified against gpt2 on all 24 chains: 192/192 spans decode to exactly their
+own `>>>` block.
 
 ### How the ground truth is checked
 

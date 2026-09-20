@@ -290,9 +290,15 @@ the expression file, so the tensor is zero-padded. `--write-features` emits
 labels describing the tensor *actually fed*, which is what stops every gene
 name shifting by 41.
 
-> **`capture-hidra` currently feeds random inputs**, so its attention is
-> structurally valid but not biologically meaningful. Fine for checking the
-> plumbing; not a result. Only the Paccmann path uses real expression data.
+`capture-hidra` reads the preprocessed tables and assembles inputs the way
+`MultiGenerator` does at train time. Each record is ided
+`<cell_line>::<compound>`, because the same line attends differently to
+different drugs. `--stage` selects train/val/test, `--limit 0` takes every row.
+
+> **Read HiDRA's pathway attention with care at low epoch counts.** After 2
+> epochs the distribution is nearly flat — max weight 2.1x uniform, against
+> 186x for Paccmann's gene axis. The model has barely learned to discriminate
+> pathways yet. Worth re-checking at 20.
 
 Check what landed:
 
@@ -382,14 +388,23 @@ predictions. The structure and the row count should match.
 
 ## 10. What is still missing
 
-**`tool_ranges` is empty and must stay that way until a tokenizer is chosen.**
-The offsets are token offsets and depend on both the evaluation tokenizer and
-how much prior-round history is prepended:
+**`tool_ranges` ships empty and is filled at evaluation time**, because the
+offsets depend on the tokenizer of the model under evaluation and on how much
+prior-round history is prepended:
 
 ```python
+import csv
+from transformers import AutoTokenizer
 from vllm_attn_connector.drp_chains import add_tool_ranges
-rows = add_tool_ranges(rows, tokenize=enc.encode, history=True)
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
+rows = list(csv.DictReader(open("/tmp/cancer_opal_chains.csv")))
+rows = add_tool_ranges(rows, tok, history=True)
 ```
+
+It needs a **fast tokenizer**, not an `encode` callable — it uses
+`return_offsets_mapping`, because token counts of substrings do not add up
+across a boundary.
 
 `history=True` accumulates prior rounds the way an evaluation harness would;
 `False` scopes each round to itself. Bogdan's two modes — ground-truth history
