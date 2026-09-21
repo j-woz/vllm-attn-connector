@@ -23,10 +23,67 @@ src/vllm_attn_connector/
     probe.py        attention-backend override that copies the decode query
     kernels.py      Triton q.Kt against the paged cache, plus a torch reference
     layout.py       KV cache layout resolution across vLLM backends
+
+    drp_emit.py     reduce attention over heads, emit through the interceptor
+    drp_capture.py  AttentionCapture base: shared metadata and workflow handling
+    drp_paccmann.py Paccmann MCA capture, via torch forward hooks
+    drp_hidra.py    HiDRA capture, via Keras named-layer extraction
+    drp_chains.py   read captured attention back, build OPAL-format chains
+    drp_cli.py      capture / inspect / predictions / chains subcommands
 tests/
     test_aggregations.py   pure torch, no GPU or vLLM needed
+    test_drp_emit.py       reduction and record shape, no framework needed
+    test_drp_chains.py     chain ground truth, re-derived from the prompts
+    drp_smoke.py           real checkpoints on CPU, both models
     e2e_smoke.py           real engine, asserts 38 properties of the output
+    e2e_example.py         multi-round chain answered by the model
+data/
+    opal_chains.csv         the plant-phenotyping benchmark
+    cancer_opal_chains.csv  the cancer counterpart, from captured attention
+docs/                       see below
 ```
+
+## Drug-response models
+
+The `drp_*` modules point the same provenance apparatus at Paccmann MCA and
+HiDRA, two drug-response regressors curated by
+[JDACS4C-IMPROVE](https://github.com/JDACS4C-IMPROVE). They emit through the
+same Flowcept interceptor, under the same field names, so one consumer reads
+both them and the vLLM connector.
+
+It is much easier than the vLLM case, because the hard half does not apply.
+Decode attention has to be recomputed here because FlashAttention discards the
+scores and `torch.compile` erases the hook point. These models are single-pass
+and eager: **the attention is already materialised**, and Paccmann even returns
+it before throwing it away (`test_paccmann.py:161` binds `pred_dict` and never
+reads it). So the work is catching what is already falling on the floor.
+
+Neither model repository is patched — forward hooks for torch, a second Keras
+model over the same trained weights for TensorFlow — matching this project's
+stance on vLLM.
+
+```bash
+python -m vllm_attn_connector.drp_cli capture-paccmann --model-dir ... --workflow-id run1
+python -m vllm_attn_connector.drp_cli inspect          --workflow-id run1
+python -m vllm_attn_connector.drp_cli chains           --workflow-id run1 --out chains.csv
+```
+
+Only training needs a GPU. Capture and chain-building do not: they were
+developed on a laptop.
+
+## Documentation
+
+| file | contents |
+|---|---|
+| [`docs/reading-guide.md`](docs/reading-guide.md) | the papers behind both models, in reading order |
+| [`docs/model-setup.md`](docs/model-setup.md) | training Paccmann and HiDRA, and the four bugs that stop them running |
+| [`docs/cancer-study.md`](docs/cancer-study.md) | what was built and why; starts from what attention and provenance are |
+| [`docs/run-log.md`](docs/run-log.md) | one full pipeline run, verbatim |
+| [`docs/quickstart-gpu.md`](docs/quickstart-gpu.md) | copy-pasteable end-to-end sequence for a GPU box |
+| [`docs/issues/`](docs/issues/) | hybrid-model bug write-ups, and the one overlap still unresolved |
+
+Start with `cancer-study.md` if you want the argument, `quickstart-gpu.md` if
+you want to run it.
 
 > This repository previously held `vllm-kvnorm`, a connector that scored
 > cache-only KV norms. That approach was retired: statistics computable from the

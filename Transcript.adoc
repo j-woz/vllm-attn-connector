@@ -768,3 +768,102 @@ constraint is what makes the `:g{gid}` suffix legible as a correctness requireme
 rather than a formatting choice. The Paccmann question in Exchange 8 then arrives
 with all the necessary groundwork already laid.
 ====
+
+== Addendum: the Paccmann analogue, implemented
+
+_Added 2026-09-17 by Rajeev Jain. The session above scoped this in Exchange 8;
+this records what was built and what it cost. Full write-up in
+`docs/cancer-study.md`._
+
+Exchange 8 estimated "one hook registration, one emit function (~60 lines), two
+call sites in `test_paccmann.py`, optionally one line in `paccmann.py`". That
+was close. The emit path came to about that size; what the estimate did not
+carry was the state of the models themselves.
+
+=== What was built
+
+Five modules over one shared base, in `src/vllm_attn_connector/`:
+
+`drp_emit.py`:: Reduces per-head attention to `attn_sum` / `attn_peak` /
+  `attn_argmax_head` -- the vLLM payload's own field names, so one consumer
+  reads both producers -- and emits through `VLLMInterceptor`. Imports no
+  framework, so it is testable in a base install.
+
+`drp_capture.py`:: `AttentionCapture`, owning everything downstream of
+  "attention is in hand". A model supplies three constants and a `collect()`.
+
+`drp_paccmann.py`:: Forward hooks on `ContextAttentionLayer`. Exchange 8 named
+  this as attach point 2 and it is the right one: hooking the layer catches all
+  16 per-head vectors *before* `paccmann.py:273-279` averages them away, so
+  `attn_peak` and `attn_argmax_head` are real rather than reconstructed from a
+  mean.
+
+`drp_hidra.py`:: A second Keras model over the same trained weights. Every
+  HiDRA attention layer is explicitly `name=`d, so the pathway distribution
+  comes out with no edit and no retraining.
+
+`drp_chains.py`:: Reads captured attention back out of MongoDB and builds
+  OPAL-format evaluation chains from it.
+
+Neither model repository is patched, matching the project's stance on vLLM.
+
+=== What the estimate did not include
+
+Neither model ran on a current environment. Four defects in Paccmann, two of
+them silent:
+
+. `np.float` removed in numpy 1.24; pytoda 1.1 raises on `device=`; predictions
+  stack to `(N,1)` where `pearsonr` wants 1-D.
+. The curated SMILES pickle is a bare `SMILESLanguage`; pytoda 1.1 wants a
+  `SMILESTokenizer`. Fixing it exposed that pytoda takes the augment flag from
+  the *language object*, so validation was being silently augmented -- val MSE
+  0.0188 -> 0.0143.
+. *Gene expression arrived as all zeros.* The v0.1.0 omics loader expects a
+  three-row header; `drp_data_v0.2.0` has one. The 2128-gene lookup matched
+  nothing and the model trained on zeros. Nothing raised. The only tell was val
+  R2 0.37 against test R2 -3.19. After the fix, test PCC 0.687 -> *0.787*.
+. *Inference was not reproducible.* pytoda assigns indices to six unseen SMILES
+  tokens from a set difference, whose iteration order varies per process, and
+  those indices hit a trained embedding. Three runs of one unchanged command
+  gave test PCC *0.787, 0.491, 0.787*.
+
+Fixes are on `github.com/rajeeja/Paccmann_MCA`, branch `rajeeja/py313-fixes`.
+Upstream `JDACS4C-IMPROVE/Paccmann_MCA` has been inactive since 2024-09.
+
+=== The measurement, and its limits
+
+Verified against real checkpoints: 16 heads captured as the architecture
+implies, every distribution a real softmax, heads disagreeing (so the per-head
+structure survived), and predictions bit-identical with capture installed --
+provenance must observe, not perturb.
+
+Exchange 8's two stated limitations both held. There is no temporal axis:
+`decode_steps_recorded` is 1, and everything step-indexed in the vLLM payload
+has no counterpart. And the quantity differs -- Paccmann's attention is
+additive/Bahdanau, HiDRA's a learned softmax gate, neither
+`softmax(qK^T/sqrt d)` -- so each record carries a `metric_reference` and the
+numbers are not pooled across producers.
+
+=== One finding worth keeping
+
+On the gene axis, *PARN is the top-attended gene on all 371 cell lines*, at
+0.9988 of the weight. Second place is three orders of magnitude down.
+
+That is the drug-response analogue of the attention sink this connector already
+excludes at position 0, and it was discovered in captured output rather than
+assumed. It is also why an attribution claim naming PARN is vacuous, and why
+the benchmark's attention task carries a distractor.
+
+[NOTE]
+.Interpretive note
+====
+Six silent failures surfaced across this work: zero gene expression that still
+trains, nondeterministic token indices that still score, zero attention that
+still conserves mass, an unwritten winner buffer that reads as "all layers tie",
+a dropped workflow record that leaves 186-wide vectors undecodable, and a wrong
+query head count that still emits a valid softmax over real keys.
+
+None raised. Each produced a well-formed, plausible, wrong result. That is the
+characteristic failure mode of instrumentation code, and the reason the test
+suite here asserts on values rather than on shapes.
+====
