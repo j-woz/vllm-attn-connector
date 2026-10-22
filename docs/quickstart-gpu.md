@@ -29,6 +29,17 @@ So the GPU matters for training at realistic epoch counts. The capture and
 chain work does not need one — which is the point, and why all of this was
 developed on a laptop.
 
+Neither model takes a device flag; both select the device themselves. Confirm
+the model actually found your card rather than trusting that it did — Paccmann
+logs the device it chose at the top of training:
+
+```
+INFO:Start Training:Device for data loader is cuda and for model is cuda
+```
+
+If that says `cpu` on a GPU node, `torch.cuda.is_available()` is False and the
+rest of the run will be slow but otherwise correct.
+
 ---
 
 ## 0. Prerequisites
@@ -81,21 +92,19 @@ git clone -b develop https://github.com/JDACS4C-IMPROVE/IMPROVE.git repos/IMPROV
 ```
 
 IMPROVE's `pyproject.toml` has malformed TOML in its `authors` table, so an
-editable install fails with `TOMLDecodeError`. Fix it in place:
+editable install fails with `TOMLDecodeError`. The connector repo carries the
+fix, so clone it now and apply:
 
 ```bash
+git clone https://github.com/rajeeja/vllm-attn-connector.git repos/vllm-attn-connector
+
 cd repos/IMPROVE
-python - <<'EOF'
-import re
-p = "pyproject.toml"
-s = open(p).read()
-s = re.sub(r'\{\s*"([^"<]+?)\s*<([^>]+)>"\s*\}', r'{ name = "\1", email = "\2" }', s)
-s = re.sub(r'\{\s*"([^"<]+?)"\s*\}', r'{ name = "\1" }', s)
-open(p, "w").write(s)
-EOF
+git apply ../vllm-attn-connector/patches/improve-pyproject-toml-fix.patch
 pip install -e .
 cd ~/spotter
 ```
+
+Packaging metadata only — no behaviour change.
 
 Do **not** `pip install improvelib` — the PyPI 0.1.0 release is missing five
 functions the models call.
@@ -168,15 +177,14 @@ export PYTHONPATH=~/spotter/repos/flowcept/src:~/spotter/repos/vllm-attn-connect
 ```bash
 cd ~/spotter
 
+# Paccmann: the fork, on that branch. Public repo, no invitation needed.
 git clone -b rajeeja/py313-fixes \
-    git@github.com:rajeeja/Paccmann_MCA.git repos/Paccmann_MCA
+    https://github.com/rajeeja/Paccmann_MCA.git repos/Paccmann_MCA
 
+# HiDRA: upstream develop, then patch it
 git clone -b develop https://github.com/JDACS4C-IMPROVE/HiDRA.git repos/HiDRA
-git clone git@github.com:j-woz/vllm-attn-connector.git repos/vllm-attn-connector
-
 cd repos/HiDRA
-git apply ../vllm-attn-connector/patches/hidra-py313-pandas3-keras3.patch 2>/dev/null \
-  || echo "patch lives in the Spotter-AI working dir; see docs/model-setup.md"
+git apply ../vllm-attn-connector/patches/hidra-py313-pandas3-keras3.patch
 cd ~/spotter
 ```
 
@@ -185,7 +193,10 @@ Two things that are easy to get wrong:
 - **Paccmann: use the fork and that branch.** Upstream `develop` imports the
   retired `improve` + `candle` API, and upstream carries none of the four fixes
   — including the one where gene expression silently arrives as all zeros.
-- **HiDRA needs the patch.** Three independent breaks under pandas 3 / Keras 3.
+  The four fixes are *commits on the branch*, not a patch; there is nothing to
+  apply on top.
+- **HiDRA needs the patch.** Three independent breaks under pandas 3 / Keras 3,
+  and the first one fires during preprocess, before training starts.
 
 ---
 

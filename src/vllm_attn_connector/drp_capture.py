@@ -30,15 +30,55 @@ spelling when an exception can skip teardown.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import Any
 
 from typing_extensions import Self
 
 from .drp_emit import ATTENTION_ACTIVITY, emit_batch
 
-__all__ = ["AttentionAxis", "AttentionCapture"]
+__all__ = ["AttentionAxis", "AttentionCapture", "to_jsonable"]
+
+
+def to_jsonable(value: Any) -> Any:
+    """Coerce a value into something the MQ serializer accepts.
+
+    Flowcept publishes through msgpack, which handles only primitives and
+    plain containers. Anything else raises ``TypeError`` *inside the flush
+    thread*, where it cannot propagate to the caller: the publish is logged
+    as an error and the record is dropped, while capture carries on and
+    exits zero.
+
+    That is the same silent-loss failure ``send_workflow`` already guards
+    against, arriving by a second route. A ``pathlib.Path`` is the one that
+    bit -- ``modelpath`` and ``smiles_language_filepath`` are Paths in
+    Paccmann's params, so every Paccmann run lost its entire configuration
+    record while reporting success.
+
+    Paths become strings, sets and tuples become lists, numpy scalars and
+    arrays become Python numbers and lists, and anything still unrecognised
+    becomes its ``repr``. Degrading to a string is deliberate: an imperfect
+    provenance record beats a dropped one.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, PurePath):
+        return os.fspath(value)
+    if isinstance(value, Mapping):
+        return {str(k): to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [to_jsonable(v) for v in value]
+    # numpy scalars/arrays, without importing numpy
+    item = getattr(value, "item", None)
+    if item is not None and getattr(value, "shape", None) == ():
+        return to_jsonable(item())
+    tolist = getattr(value, "tolist", None)
+    if tolist is not None:
+        return to_jsonable(tolist())
+    return repr(value)
 
 
 @dataclass
@@ -183,6 +223,12 @@ class AttentionCapture:
         here is silently dropped, taking the configuration with it. That is not
         hypothetical: it is how a HiDRA run lost its ``pathway_order`` and left
         the attention vectors undecodable.
+
+        The conf is passed through :func:`to_jsonable` for the same reason.
+        Flowcept serializes with msgpack on a background thread, so a value
+        it cannot pack -- a ``Path``, a numpy scalar -- is dropped there with
+        only a log line, and capture still exits zero. Paccmann's params
+        carry two ``Path`` objects, which cost every run its conf record.
         """
         conf = {
             "model": self.MODEL_NAME,
@@ -190,6 +236,7 @@ class AttentionCapture:
             "metric_reference": self.METRIC_REFERENCE,
         }
         conf.update(self.workflow_conf(params))
+        conf = to_jsonable(conf)
         conf_id = f"{self.workflow_id}:conf"
         self.interceptor.send_model_workflow(
             conf_id, conf, parent_workflow_id=self.workflow_id
