@@ -9,3 +9,4 @@ output/
 # Transcript.adoc under "Vendored sources".
 deps/
 flowcept_buffer*.jsonl
+flowcept.log

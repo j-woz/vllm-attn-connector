@@ -1,0 +1,66 @@
+diff --git a/HiDRA_infer_improve.py b/HiDRA_infer_improve.py
+index 1ff2fce..c9fed82 100644
+--- a/HiDRA_infer_improve.py
++++ b/HiDRA_infer_improve.py
+@@ -31,7 +31,10 @@ def run(params):
+         model_file_format=params["model_file_format"],
+         model_dir=params["input_model_dir"])
+ 
+-    model = load_model(str(modelpath))
++    # Keras 3 cannot deserialize the 'mse' loss string saved into the legacy .h5
++    # ("Could not deserialize 'keras.metrics.mse'"). Inference only calls
++    # predict(), so skip rebuilding the optimizer/loss entirely.
++    model = load_model(str(modelpath), compile=False)
+ 
+     test_label = test_label.to_numpy().flatten()
+     test_pred = model.predict(test_input).flatten()
+diff --git a/HiDRA_preprocess_improve.py b/HiDRA_preprocess_improve.py
+index da28501..ee83194 100644
+--- a/HiDRA_preprocess_improve.py
++++ b/HiDRA_preprocess_improve.py
+@@ -35,7 +35,11 @@ def run(params: Dict):
+ 
+     # Check that z-score is on the correct axis
+     numeric_cols = ge.select_dtypes(include=[np.number]).columns
+-    ge[numeric_cols] = ge[numeric_cols].apply(zscore, axis=1)
++    # pandas >=3.0 returns a Series-of-arrays from .apply(..., axis=1) instead of
++    # expanding to a DataFrame, which raises "Columns must be same length as key".
++    # Apply the row-wise z-score directly on the ndarray instead -- same result,
++    # and it avoids the per-row Python call.
++    ge[numeric_cols] = zscore(ge[numeric_cols].to_numpy(dtype=float), axis=1)
+ 
+     print("\nLoading drugs data...")
+     mf = frm.get_x_data(file = params['drug_ecfp_file'], 
+diff --git a/hidra_utils.py b/hidra_utils.py
+index 81f290a..a09bbd7 100644
+--- a/hidra_utils.py
++++ b/hidra_utils.py
+@@ -173,7 +173,10 @@ class DataGenerator(Sequence):
+             df = self.expr[self.genes]
+             X = df.loc[batch_labels['improve_sample_id']]
+ 
+-        return X
++        # Keras 3 flattens inputs with optree and calls .dtype on each leaf, which
++        # a DataFrame does not have ('DataFrame' object has no attribute 'dtype').
++        # Hand back a plain float32 ndarray instead.
++        return X.to_numpy(dtype=np.float32)
+ 
+ 
+ class MultiGenerator(Sequence):
+@@ -203,7 +206,7 @@ class MultiGenerator(Sequence):
+ 
+         # Generate data
+         X = self.__data_generation(batch_labels, indexes)
+-        y = np.asarray([x for x in batch_labels[self.y_col]])
++        y = np.asarray(batch_labels[self.y_col], dtype=np.float32)
+ 
+         return X, y
+ 
+@@ -228,4 +231,6 @@ class MultiGenerator(Sequence):
+         X_gen, y = d_g.__getitem__()
+         X.append(X_gen)
+ 
+-        return X
++        # Keras 3 infers output_signature per element and rejects a bare list as a
++        # multi-input structure. A tuple is treated as a proper nested structure.
++        return tuple(X)
